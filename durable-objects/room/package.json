@@ -1,0 +1,22 @@
+{
+  "name": "@ai-company/room",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-company/agent": "workspace:*",
+    "@ai-company/domain": "workspace:*",
+    "@ai-company/organization": "workspace:*",
+    "@ai-company/task": "workspace:*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261008.1",
+    "typescript": "^5.9.3"
+  }
+}

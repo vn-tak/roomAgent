@@ -1,0 +1,8 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "durable-objects/*"
+
+onlyBuiltDependencies:
+  - esbuild
+  - workerd

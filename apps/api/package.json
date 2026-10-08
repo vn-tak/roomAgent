@@ -1,0 +1,29 @@
+{
+  "name": "@ai-company/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p test/tsconfig.json",
+    "test": "vitest run",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@ai-company/agent": "workspace:*",
+    "@ai-company/artifact": "workspace:*",
+    "@ai-company/db": "workspace:*",
+    "@ai-company/organization": "workspace:*",
+    "@ai-company/room": "workspace:*",
+    "@ai-company/task": "workspace:*",
+    "hono": "4.10.7"
+  },
+  "devDependencies": {
+    "@ai-company/domain": "workspace:*",
+    "@ai-company/policy": "workspace:*",
+    "@cloudflare/vitest-plugin": "^1.3.7",
+    "@types/node": "22.19.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.148.0"
+  }
+}

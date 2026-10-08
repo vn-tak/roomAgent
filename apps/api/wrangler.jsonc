@@ -1,0 +1,86 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ai-company-os-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-08",
+  // Local placeholder only. Do not point this at an existing production database.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-company-os",
+      "database_id": "00000000-0000-4000-8000-000000000001",
+      "migrations_dir": "../../migrations",
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "ORGANIZATION", "class_name": "OrganizationDO" },
+      { "name": "ROOM", "class_name": "RoomDO" },
+      { "name": "AGENT", "class_name": "AgentDO" },
+      { "name": "TASK", "class_name": "TaskDO" },
+      { "name": "ARTIFACT", "class_name": "ArtifactDO" },
+    ],
+  },
+  // Declarative SQLite classes. Do not add a legacy migrations entry beside exports.
+  "exports": {
+    "OrganizationDO": { "type": "durable-object", "storage": "sqlite" },
+    "RoomDO": { "type": "durable-object", "storage": "sqlite" },
+    "AgentDO": { "type": "durable-object", "storage": "sqlite" },
+    "TaskDO": { "type": "durable-object", "storage": "sqlite" },
+    "ArtifactDO": { "type": "durable-object", "storage": "sqlite" },
+  },
+  // Local bucket name only. Do not create this bucket on the live account.
+  "r2_buckets": [
+    {
+      "binding": "ARTIFACTS",
+      "bucket_name": "ai-company-os-artifacts",
+    },
+  ],
+  // Local workflow name only. Do not create this workflow on the live account.
+  "workflows": [
+    {
+      "binding": "PRODUCTION_TASK",
+      "name": "ai-company-os-production-task",
+      "class_name": "ProductionTaskWorkflow",
+    },
+  ],
+  // Local queue names only. Do not create these on the live account from this phase.
+  "queues": {
+    "producers": [
+      { "binding": "DOMAIN_EVENTS", "queue": "ai-company-os-domain-events" },
+      { "binding": "AGENT_DELIVERY", "queue": "ai-company-os-agent-delivery" },
+      { "binding": "DEAD_LETTER", "queue": "ai-company-os-dead-letter" },
+    ],
+    "consumers": [
+      {
+        "queue": "ai-company-os-domain-events",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0,
+        "max_retries": 2,
+        "retry_delay": 0,
+        "max_concurrency": 1,
+        "dead_letter_queue": "ai-company-os-dead-letter",
+      },
+      {
+        "queue": "ai-company-os-agent-delivery",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0,
+        "max_retries": 2,
+        "retry_delay": 0,
+        "max_concurrency": 1,
+        "dead_letter_queue": "ai-company-os-dead-letter",
+      },
+      {
+        "queue": "ai-company-os-dead-letter",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0,
+        "max_retries": 0,
+        "max_concurrency": 1,
+      },
+    ],
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+  },
+}

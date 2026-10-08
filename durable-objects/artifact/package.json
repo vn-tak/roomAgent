@@ -1,0 +1,20 @@
+{
+  "name": "@ai-company/artifact",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-company/domain": "workspace:*",
+    "@ai-company/organization": "workspace:*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261008.1",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,1 @@
+export const MAX_WORKFLOW_ITERATIONS = 8;
