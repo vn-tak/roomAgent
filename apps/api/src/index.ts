@@ -1,4 +1,4 @@
-import { isId } from "@ai-company/domain";
+import { sha256Hex, isId } from "@ai-company/domain";
 import { Hono } from "hono";
 import { registerArtifactRoutes } from "./artifacts-route";
 import { registerGovernanceRoutes } from "./governance-route";
@@ -118,6 +118,37 @@ app.post("/orgs/:orgId/join", async (c) => {
     },
     status,
   );
+});
+
+app.post("/j/:token", async (c) => {
+  const requestId = c.get("requestId");
+  const token = c.req.param("token");
+  if (!/^[0-9a-f]{64}$/.test(token)) {
+    return c.json(notFoundBody(requestId, "Join was not found."), 404);
+  }
+  const join = await c.env.DB.prepare(
+    `SELECT org_id, employee_id FROM join_codes WHERE code_hash = ?`,
+  )
+    .bind(await sha256Hex(token))
+    .first<{ org_id: string; employee_id: string }>();
+  if (!join) return c.json(notFoundBody(requestId, "Join was not found."), 404);
+  const result = await c.env.AGENT.getByName(`agent:${join.org_id}:${join.employee_id}`).redeem({
+    orgId: join.org_id,
+    employeeId: join.employee_id,
+    code: token,
+  });
+  if (result.decision === "DENY") {
+    return c.json(
+      { error: { code: result.reason, message: "Join was rejected.", request_id: requestId } },
+      result.reason === "THROTTLED" ? 429 : 403,
+    );
+  }
+  c.header("cache-control", "no-store");
+  return c.json({
+    session_id: result.sessionId,
+    token: result.token,
+    expires_at: result.expiresAt,
+  });
 });
 
 app.get("/orgs/:orgId/agents/:employeeId/socket", async (c) => {

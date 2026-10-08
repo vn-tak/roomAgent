@@ -64,6 +64,8 @@ export interface IssueJoinCodeResult {
   joinId: string | null;
   code: string | null;
   expiresAt: string | null;
+  joinToken?: string;
+  joinPath?: string;
 }
 
 export interface RevokeJoinCodeCommand extends ActorCommand {
@@ -140,6 +142,70 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
       return deny("TENANT_BOUNDARY", 0);
     }
     return decideAuthorization(this.snapshot(), command);
+  }
+
+  // Trusted RPC bootstrap only; HTTP never accepts a claimed human identity.
+  async issueHumanSession(command: ActorCommand & { ttlSeconds: number }) {
+    const gate = await this.gate(command, "runtime.bind");
+    if (gate.decision === "DENY" || command.actorType !== "human") {
+      return {
+        decision: "DENY" as const,
+        reason: "PERMISSION_DENIED",
+        token: null,
+        sessionId: null,
+      };
+    }
+    if (
+      !Number.isInteger(command.ttlSeconds) ||
+      command.ttlSeconds < 1 ||
+      command.ttlSeconds > 3600
+    ) {
+      return { decision: "DENY" as const, reason: "INVALID_INPUT", token: null, sessionId: null };
+    }
+    const token = `hum_${randomSecret()}`;
+    const sessionId = createId("ses");
+    const expiresAt = new Date(Date.now() + command.ttlSeconds * 1000).toISOString();
+    await this.env.DB.prepare(
+      `INSERT INTO human_sessions (id, org_id, user_id, token_hash, expires_at, revoked_at, created_at)
+       VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+    )
+      .bind(
+        sessionId,
+        command.orgId,
+        command.actorId,
+        await sha256Hex(token),
+        expiresAt,
+        this.now(),
+      )
+      .run();
+    return { decision: "ALLOW" as const, reason: "ALLOWED", token, sessionId, expiresAt };
+  }
+
+  async verifyHumanSession(command: { orgId: string; token: string }) {
+    if (this.boundary(command.orgId) || !/^hum_[0-9a-f]{64}$/.test(command.token)) {
+      return { decision: "DENY" as const, reason: "SESSION_INVALID", userId: null };
+    }
+    const row = await this.env.DB.prepare(
+      `SELECT s.user_id FROM human_sessions s
+       JOIN organizations o ON o.id = s.org_id AND o.status = 'active'
+       WHERE s.org_id = ? AND s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?`,
+    )
+      .bind(command.orgId, await sha256Hex(command.token), this.now())
+      .first<{ user_id: string }>();
+    return row
+      ? { decision: "ALLOW" as const, reason: "ALLOWED", userId: row.user_id }
+      : { decision: "DENY" as const, reason: "SESSION_INVALID", userId: null };
+  }
+
+  async revokeHumanSession(command: ActorCommand & { sessionId: string }) {
+    const gate = await this.gate(command, "runtime.bind");
+    if (gate.decision === "DENY" || command.actorType !== "human") return gate;
+    await this.env.DB.prepare(
+      `UPDATE human_sessions SET revoked_at = ? WHERE org_id = ? AND id = ? AND user_id = ?`,
+    )
+      .bind(this.now(), command.orgId, command.sessionId, command.actorId)
+      .run();
+    return gate;
   }
 
   async assignRole(command: AssignRoleCommand): Promise<AuthorityDecision> {
@@ -529,6 +595,8 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
       joinId,
       code,
       expiresAt,
+      joinToken: code,
+      joinPath: `/j/${code}`,
     };
   }
 
@@ -590,14 +658,14 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
       return consumeDeny("TENANT_BOUNDARY");
     }
     if (!isId(command.employeeId, "emp")) {
-      this.noteFailure();
+      this.noteFailure(command.employeeId);
       return consumeDeny("TENANT_BOUNDARY");
     }
-    if (this.throttled()) {
+    if (this.throttled(command.employeeId)) {
       return consumeDeny("THROTTLED");
     }
     if (!/^[0-9a-f]{64}$/.test(command.code)) {
-      this.noteFailure();
+      this.noteFailure(command.employeeId);
       return consumeDeny("INVALID_CODE");
     }
     const hash = await sha256Hex(command.code);
@@ -606,20 +674,20 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
       const remote = await this.env.DB.prepare(`SELECT org_id FROM join_codes WHERE code_hash = ?`)
         .bind(hash)
         .first<{ org_id: string }>();
-      this.noteFailure();
+      this.noteFailure(command.employeeId);
       return consumeDeny(remote && remote.org_id !== command.orgId ? "WRONG_ORG" : "INVALID_CODE");
     }
     if (local.employee_id !== command.employeeId) {
-      this.noteFailure();
+      this.noteFailure(command.employeeId);
       return consumeDeny("WRONG_EMPLOYEE");
     }
     const status = await this.targetStatus(command.orgId, command.employeeId);
     if (!status) {
-      this.noteFailure();
+      this.noteFailure(command.employeeId);
       return consumeDeny("TENANT_BOUNDARY");
     }
     if (status === "suspended") {
-      this.noteFailure();
+      this.noteFailure(command.employeeId);
       return consumeDeny("SUSPENDED_AGENT_DENY");
     }
     const nowIso = this.now();
@@ -667,7 +735,7 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
         throw error;
       }
     }
-    this.noteFailure();
+    this.noteFailure(command.employeeId);
     const reason =
       claimed.kind === "expired"
         ? "EXPIRED"
@@ -737,6 +805,11 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
         revoked_at TEXT
       )`,
       `CREATE UNIQUE INDEX IF NOT EXISTS join_codes_hash ON join_codes (code_hash)`,
+      `CREATE TABLE IF NOT EXISTS join_redemption_failures (
+        employee_id TEXT PRIMARY KEY,
+        window_started_at INTEGER NOT NULL,
+        failures INTEGER NOT NULL
+      )`,
       `CREATE TABLE IF NOT EXISTS join_failures (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         window_started_at INTEGER NOT NULL,
@@ -1194,44 +1267,40 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
     });
   }
 
-  private failureRow(): FailureRow | null {
+  private failureRow(employeeId: string): FailureRow | null {
     return (
       this.ctx.storage.sql
-        .exec<FailureRow>(`SELECT window_started_at, failures FROM join_failures WHERE id = 1`)
+        .exec<FailureRow>(
+          `SELECT window_started_at, failures FROM join_redemption_failures WHERE employee_id = ?`,
+          employeeId,
+        )
         .toArray()[0] ?? null
     );
   }
 
-  private throttled(): boolean {
-    let blocked = false;
-    this.ctx.storage.transactionSync(() => {
-      const row = this.failureRow();
-      blocked =
-        !!row &&
-        Date.now() - row.window_started_at < JOIN_WINDOW_MS &&
-        row.failures >= JOIN_FAILURE_LIMIT;
-    });
-    return blocked;
+  private throttled(employeeId: string): boolean {
+    const row = this.failureRow(employeeId);
+    return (
+      !!row &&
+      Date.now() - row.window_started_at < JOIN_WINDOW_MS &&
+      row.failures >= JOIN_FAILURE_LIMIT
+    );
   }
 
-  private noteFailure(): void {
+  private noteFailure(employeeId: string): void {
     this.ctx.storage.transactionSync(() => {
-      const row = this.failureRow();
       const now = Date.now();
-      if (!row || now - row.window_started_at >= JOIN_WINDOW_MS) {
-        this.ctx.storage.sql.exec(`DELETE FROM join_failures`);
-        this.ctx.storage.sql.exec(
-          `INSERT INTO join_failures (id, window_started_at, failures) VALUES (1, ?, 1)`,
-          now,
-        );
-        return;
-      }
-      if (row.failures >= JOIN_FAILURE_LIMIT) {
-        return;
-      }
       this.ctx.storage.sql.exec(
-        `UPDATE join_failures SET failures = ? WHERE id = 1`,
-        row.failures + 1,
+        `DELETE FROM join_redemption_failures WHERE window_started_at <= ?`,
+        now - JOIN_WINDOW_MS,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO join_redemption_failures (employee_id, window_started_at, failures)
+         VALUES (?, ?, 1)
+         ON CONFLICT(employee_id) DO UPDATE SET failures = MIN(failures + 1, ?)`,
+        employeeId,
+        now,
+        JOIN_FAILURE_LIMIT,
       );
     });
   }
