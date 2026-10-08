@@ -50,6 +50,7 @@ export {
 export {
   MAX_ARTIFACT_BASE64,
   MAX_ARTIFACT_BYTES,
+  MAX_DIRECT_ARTIFACT_BYTES,
   artifactObjectKey,
   canonicalMediaType,
   isArtifactFilename,

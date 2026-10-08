@@ -1,4 +1,4 @@
-import { artifactObjectKey, canonicalMediaType, MAX_ARTIFACT_BYTES } from "./artifact";
+import { artifactObjectKey, canonicalMediaType, MAX_DIRECT_ARTIFACT_BYTES } from "./artifact";
 import { createId, isId } from "./ids";
 import { isTaskState, type TaskCommandName, type TaskState } from "./task-machine";
 
@@ -104,6 +104,8 @@ export interface GovernanceDomainEvent extends EventEnvelope {
 export type DomainEvent = TaskDomainEvent | ArtifactDomainEvent | GovernanceDomainEvent;
 
 export interface TaskEventInput {
+  correlationId?: string;
+  causationId?: string;
   command: TaskCommandName;
   orgId: string;
   actorType: "human" | "employee";
@@ -122,6 +124,8 @@ export interface TaskEventInput {
 }
 
 export interface ArtifactEventInput {
+  correlationId?: string;
+  causationId?: string;
   orgId: string;
   actorType: "human" | "employee";
   actorId: string;
@@ -137,6 +141,7 @@ export interface ArtifactEventInput {
 }
 
 export interface GovernanceEventInput {
+  causationId?: string;
   eventId: string;
   correlationId: string;
   type: GovernanceEventType;
@@ -194,7 +199,7 @@ export function taskEventType(command: TaskCommandName, paused: boolean): TaskEv
 }
 
 export function buildTaskEvent(input: TaskEventInput): TaskDomainEvent {
-  const paused = input.state === "PAUSED" && input.pauseReason === "LOOP_GUARD";
+  const paused = input.state === "PAUSED";
   const review = input.humanReviewRequired === 1 ? 1 : 0;
   return {
     event_id: createId("evt"),
@@ -207,8 +212,8 @@ export function buildTaskEvent(input: TaskEventInput): TaskDomainEvent {
     subject_type: "task",
     subject_id: input.taskId,
     seq: input.version,
-    correlation_id: createId("corr"),
-    causation_id: input.idempotencyKey,
+    correlation_id: input.correlationId ?? createId("corr"),
+    causation_id: input.causationId ?? input.idempotencyKey,
     idempotency_key: input.idempotencyKey,
     occurred_at: input.occurredAt,
     payload: {
@@ -239,7 +244,7 @@ export function buildGovernanceEvent(input: GovernanceEventInput): GovernanceDom
     subject_id: input.artifactId,
     seq: input.version,
     correlation_id: input.correlationId,
-    causation_id: input.idempotencyKey,
+    causation_id: input.causationId ?? input.idempotencyKey,
     idempotency_key: input.idempotencyKey,
     occurred_at: input.occurredAt,
     payload: {
@@ -268,8 +273,8 @@ export function buildArtifactEvent(input: ArtifactEventInput): ArtifactDomainEve
     subject_type: "artifact",
     subject_id: input.artifactId,
     seq: input.version,
-    correlation_id: createId("corr"),
-    causation_id: input.idempotencyKey,
+    correlation_id: input.correlationId ?? createId("corr"),
+    causation_id: input.causationId ?? input.idempotencyKey,
     idempotency_key: input.idempotencyKey,
     occurred_at: input.occurredAt,
     payload: {
@@ -580,7 +585,7 @@ function parseArtifactPayload(
     !Number.isInteger(size) ||
     typeof size !== "number" ||
     size < 1 ||
-    size > MAX_ARTIFACT_BYTES ||
+    size > MAX_DIRECT_ARTIFACT_BYTES ||
     !r2Key ||
     r2Key !== artifactObjectKey(envelope.org_id, envelope.room_id, envelope.subject_id, version)
   ) {
