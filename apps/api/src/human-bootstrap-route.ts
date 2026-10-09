@@ -12,7 +12,7 @@ const SESSION_TTL_SECONDS = 900;
 interface IdentityRow {
   id: string;
   user_id: string;
-  subject: string | null;
+  email: string;
   status: string;
 }
 
@@ -90,6 +90,8 @@ async function revoke(c: BootstrapContext): Promise<Response> {
   return c.json({ session_id: revoked.sessionId, revoked: true });
 }
 
+// The operator provisions (issuer, subject, email) with an approval reference before first
+// use. Identity is the verified Access subject; the email must still match it.
 async function resolveIdentity(
   env: Env,
   issuer: string,
@@ -97,26 +99,21 @@ async function resolveIdentity(
   subject: string,
 ): Promise<{ ok: true; row: IdentityRow } | { ok: false; reason: string }> {
   const row = await env.DB.prepare(
-    `SELECT id, user_id, subject, status FROM human_identities WHERE issuer = ? AND email = ?`,
+    `SELECT id, user_id, email, status FROM human_identities WHERE issuer = ? AND subject = ?`,
   )
-    .bind(issuer, email)
+    .bind(issuer, subject)
     .first<IdentityRow>();
-  if (!row) return { ok: false, reason: "IDENTITY_NOT_MAPPED" };
-  if (row.status !== "active") return { ok: false, reason: "IDENTITY_DISABLED" };
-  if (row.subject === null) {
-    // Pin the Access subject on first verified use so a reassigned email cannot inherit it.
-    await env.DB.prepare(
-      `UPDATE human_identities SET subject = ?, updated_at = ? WHERE id = ? AND subject IS NULL`,
+  if (!row) {
+    // A known email under an unknown subject is a reassigned or impersonated account.
+    const byEmail = await env.DB.prepare(
+      `SELECT 1 AS found FROM human_identities WHERE issuer = ? AND email = ?`,
     )
-      .bind(subject, new Date().toISOString(), row.id)
-      .run();
-    const pinned = await env.DB.prepare(`SELECT subject FROM human_identities WHERE id = ?`)
-      .bind(row.id)
-      .first<{ subject: string | null }>();
-    if (pinned?.subject !== subject) return { ok: false, reason: "IDENTITY_MISMATCH" };
-    return { ok: true, row: { ...row, subject } };
+      .bind(issuer, email)
+      .first<{ found: number }>();
+    return { ok: false, reason: byEmail ? "IDENTITY_MISMATCH" : "IDENTITY_NOT_MAPPED" };
   }
-  if (row.subject !== subject) return { ok: false, reason: "IDENTITY_MISMATCH" };
+  if (row.email !== email) return { ok: false, reason: "IDENTITY_MISMATCH" };
+  if (row.status !== "active") return { ok: false, reason: "IDENTITY_DISABLED" };
   return { ok: true, row };
 }
 

@@ -43,6 +43,8 @@ export interface Prepared {
   qaToken: string;
   workerReviewToken: string;
   securityToken: string;
+  managerId: string;
+  executiveId: string;
 }
 
 export async function prepare(name: string): Promise<Prepared> {
@@ -50,15 +52,22 @@ export async function prepare(name: string): Promise<Prepared> {
   const worker = await hire(studio.store, studio.org.id, `${name} worker`);
   const qa = await hire(studio.store, studio.org.id, `${name} QA`);
   const security = await hire(studio.store, studio.org.id, `${name} security`);
+  // Hired before OrganizationDO hydrates so the authority snapshot includes them.
+  const manager = await hire(studio.store, studio.org.id, `${name} manager`);
+  const executive = await hire(studio.store, studio.org.id, `${name} executive`);
   const owner = ownerOf(studio.org);
   const orgDo = organizationStub(studio.org.id);
   const employeeRole = await roleByCode(studio.store, studio.org.id, "employee");
   const qaRole = await roleByCode(studio.store, studio.org.id, "qa");
   const securityRole = await roleByCode(studio.store, studio.org.id, "security");
+  const managerRole = await roleByCode(studio.store, studio.org.id, "manager");
+  const executiveRole = await roleByCode(studio.store, studio.org.id, "executive");
   for (const [employee, role] of [
     [worker, employeeRole],
     [qa, qaRole],
     [security, securityRole],
+    [manager, managerRole],
+    [executive, executiveRole],
   ] as const) {
     expect(
       (await orgDo.assignRole({ ...owner, employeeId: employee.id, roleId: role.id })).decision,
@@ -148,6 +157,8 @@ export async function prepare(name: string): Promise<Prepared> {
     qaToken: qaSession.token,
     workerReviewToken: workerSession.token,
     securityToken: securitySession.token,
+    managerId: manager.id,
+    executiveId: executive.id,
   };
 }
 

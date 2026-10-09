@@ -77,18 +77,21 @@ afterAll(() => {
   vi.restoreAllMocks();
 });
 
+// Mirrors operator provisioning: the verified Access subject is known before first use.
 async function mapIdentity(
   userId: string,
   email: string,
+  subject: string,
   status: "active" | "disabled" = "active",
 ): Promise<string> {
   const id = createId("usr").replace("usr_", "hid_");
   const now = new Date().toISOString();
   await env.DB.prepare(
-    `INSERT INTO human_identities (id, issuer, email, subject, user_id, status, created_at, updated_at)
-     VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
+    `INSERT INTO human_identities
+       (id, issuer, email, subject, user_id, attestation_ref, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'CHANGE-0001 test approval', ?, ?, ?)`,
   )
-    .bind(id, TEAM, email, userId, status, now, now)
+    .bind(id, TEAM, email, subject, userId, status, now, now)
     .run();
   return id;
 }
@@ -103,7 +106,11 @@ async function bootstrap(orgId: string, headers: Record<string, string>): Promis
 describe("human operator bootstrap through Cloudflare Access", () => {
   it("issues a short-lived, tenant-bound, audited session for a verified owner", async () => {
     const { org } = await createStudio("Access owner");
-    const identityId = await mapIdentity(org.createdByUserId, "owner@roomagent.test");
+    const identityId = await mapIdentity(
+      org.createdByUserId,
+      "owner@roomagent.test",
+      "access-sub-owner",
+    );
     const response = await bootstrap(org.id, {
       "cf-access-jwt-assertion": await accessToken({
         email: "Owner@RoomAgent.test",
@@ -139,10 +146,10 @@ describe("human operator bootstrap through Cloudflare Access", () => {
       .first<{ identity_id: string; token_hash: string }>();
     expect(stored?.identity_id).toBe(identityId);
     expect(stored?.token_hash).not.toBe(body.token);
-    const pinned = await env.DB.prepare(`SELECT subject FROM human_identities WHERE id = ?`)
+    const provisioned = await env.DB.prepare(`SELECT subject FROM human_identities WHERE id = ?`)
       .bind(identityId)
       .first<{ subject: string }>();
-    expect(pinned?.subject).toBe("access-sub-owner");
+    expect(provisioned?.subject).toBe("access-sub-owner");
     const audit = await env.DB.prepare(
       `SELECT action, method FROM human_session_audit WHERE session_id = ?`,
     )
@@ -162,7 +169,7 @@ describe("human operator bootstrap through Cloudflare Access", () => {
 
   it("denies untrusted, forged, wrong-audience, wrong-issuer, and expired identities", async () => {
     const { org } = await createStudio("Access forged");
-    await mapIdentity(org.createdByUserId, "forged@roomagent.test");
+    await mapIdentity(org.createdByUserId, "forged@roomagent.test", "access-sub-forged");
     const claims = { email: "forged@roomagent.test", sub: "access-sub-forged" };
     const now = Math.floor(Date.now() / 1000);
 
@@ -200,7 +207,7 @@ describe("human operator bootstrap through Cloudflare Access", () => {
   it("denies a verified identity for an organization it does not own, or that is unmapped", async () => {
     const owned = await createStudio("Access home org");
     const foreign = await createStudio("Access foreign org");
-    await mapIdentity(owned.org.createdByUserId, "home@roomagent.test");
+    await mapIdentity(owned.org.createdByUserId, "home@roomagent.test", "access-sub-home");
     const assertion = await accessToken({ email: "home@roomagent.test", sub: "access-sub-home" });
 
     const wrongOrg = await bootstrap(foreign.org.id, { "cf-access-jwt-assertion": assertion });
@@ -219,7 +226,11 @@ describe("human operator bootstrap through Cloudflare Access", () => {
 
   it("revokes a session and denies disabled identities, including their live sessions", async () => {
     const { org } = await createStudio("Access revoke");
-    const identityId = await mapIdentity(org.createdByUserId, "revoke@roomagent.test");
+    const identityId = await mapIdentity(
+      org.createdByUserId,
+      "revoke@roomagent.test",
+      "access-sub-rv",
+    );
     const assertion = await accessToken({ email: "revoke@roomagent.test", sub: "access-sub-rv" });
     const first = await (
       await bootstrap(org.id, { "cf-access-jwt-assertion": assertion })
@@ -259,5 +270,79 @@ describe("human operator bootstrap through Cloudflare Access", () => {
     expect((await disabled.json<{ error: { code: string } }>()).error.code).toBe(
       "IDENTITY_DISABLED",
     );
+  });
+
+  it("rejects an email reassigned before the owner's first bootstrap", async () => {
+    const { org } = await createStudio("Access reassigned first use");
+    const identityId = await mapIdentity(
+      org.createdByUserId,
+      "first@roomagent.test",
+      "access-sub-legit-owner",
+    );
+    // The very first request comes from whoever now holds the email in the IdP.
+    const hijack = await bootstrap(org.id, {
+      "cf-access-jwt-assertion": await accessToken({
+        email: "first@roomagent.test",
+        sub: "access-sub-new-holder",
+      }),
+    });
+    expect(hijack.status).toBe(403);
+    expect((await hijack.json<{ error: { code: string } }>()).error.code).toBe("IDENTITY_MISMATCH");
+    const row = await env.DB.prepare(`SELECT subject FROM human_identities WHERE id = ?`)
+      .bind(identityId)
+      .first<{ subject: string }>();
+    expect(row?.subject).toBe("access-sub-legit-owner");
+    const sessions = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM human_sessions WHERE org_id = ?`,
+    )
+      .bind(org.id)
+      .first<{ n: number }>();
+    expect(sessions?.n).toBe(0);
+
+    // The provisioned subject under a different email is also refused.
+    const renamed = await bootstrap(org.id, {
+      "cf-access-jwt-assertion": await accessToken({
+        email: "renamed@roomagent.test",
+        sub: "access-sub-legit-owner",
+      }),
+    });
+    expect(renamed.status).toBe(403);
+
+    const legit = await bootstrap(org.id, {
+      "cf-access-jwt-assertion": await accessToken({
+        email: "first@roomagent.test",
+        sub: "access-sub-legit-owner",
+      }),
+    });
+    expect(legit.status).toBe(201);
+  });
+
+  it("refuses identity mappings without a provisioned subject and attestation", async () => {
+    const { org } = await createStudio("Access no subject");
+    const now = new Date().toISOString();
+    const insert = (subject: string | null, attestation: string | null) =>
+      env.DB.prepare(
+        `INSERT INTO human_identities
+           (id, issuer, email, subject, user_id, attestation_ref, status, created_at, updated_at)
+         VALUES (?, ?, 'nosub@roomagent.test', ?, ?, ?, 'active', ?, ?)`,
+      )
+        .bind(
+          createId("usr").replace("usr_", "hid_"),
+          TEAM,
+          subject,
+          org.createdByUserId,
+          attestation,
+          now,
+          now,
+        )
+        .run();
+    await expect(insert(null, "CHANGE-0002 approval")).rejects.toThrow();
+    await expect(insert("access-sub-x", null)).rejects.toThrow();
+    const identityId = await mapIdentity(org.createdByUserId, "pin@roomagent.test", "sub-pin");
+    await expect(
+      env.DB.prepare(`UPDATE human_identities SET subject = 'sub-other' WHERE id = ?`)
+        .bind(identityId)
+        .run(),
+    ).rejects.toThrow(/IDENTITY_IMMUTABLE/);
   });
 });

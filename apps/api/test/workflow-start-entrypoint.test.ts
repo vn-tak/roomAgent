@@ -305,7 +305,7 @@ describe("workflow start entrypoint", () => {
     expect(await workflows.get()).toHaveLength(1);
   });
 
-  it("recovers a claim stranded before instance creation and releases terminal runs", async () => {
+  it("recovers a claim stranded before instance creation and holds denied runs", async () => {
     await using workflows = await introspectWorkflow(env.PRODUCTION_TASK);
     const prepared = await prepare("Start recovery");
     const token = await ownerToken(prepared);
@@ -365,6 +365,24 @@ describe("workflow start entrypoint", () => {
       QA_EVIDENCE_EVENT,
     );
     await untilRun(prepared.org.id, stranded, "denied");
+
+    // A QA denial is a governance hold: a new key cannot start over until it is resolved.
+    const held = await startRun(prepared.org.id, prepared.taskId, body, as(token, "start_held"));
+    expect(held.status).toBe(409);
+    expect((await held.json<ErrorBody>()).error).toMatchObject({
+      code: "WORKFLOW_HELD",
+      workflow_run_id: stranded,
+      hold_reason: "QA_FAILED",
+    });
+    const resolution = await exports.default.fetch(
+      `https://company.local/orgs/${prepared.org.id}/workflow-runs/${stranded}/resolution`,
+      {
+        method: "POST",
+        headers: { ...as(token, "start_resolve_qa"), "content-type": "application/json" },
+        body: JSON.stringify({ hold_reason: "QA_FAILED" }),
+      },
+    );
+    expect(resolution.status).toBe(200);
 
     const restarted = await startRun(
       prepared.org.id,

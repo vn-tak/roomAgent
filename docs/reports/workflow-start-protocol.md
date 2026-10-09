@@ -100,11 +100,46 @@ a `workflow_runs` row.
 | Concurrent create of the same id           | `instance.already_exists` is caught and `get(id)` is confirmed |
 | Same key with different task/artifact/     | 409 `IDEMPOTENCY_MISMATCH`; no run id is disclosed             |
 | version/actor                              |                                                                |
-| Run reaches `complete`/`denied`/`paused`   | The next start releases the claim and admits a new run         |
-| Instance errored before registering        | Released once `get(id).status()` reports `errored`/            |
-|                                            | `terminated`/`complete` (or a `created` instance is gone)      |
-| Registered run whose instance died         | Run marked `paused`, claim released, task startable again      |
+| Run reaches `complete`                     | Released (`completed`); a new run may start                    |
+| Run is `paused` or `denied`                | **Held.** 409 `WORKFLOW_HELD` with `hold_reason`, for any key, |
+|                                            | until an explicit resolution (below)                           |
+| Instance errored before registering        | Released (`never_registered`) once `get(id).status()` reports  |
+|                                            | `errored`/`terminated`/`complete` (or a `created` one is gone) |
+| Registered run whose instance died at      | Run marked `paused`/`INSTANCE_FAILED`, released automatically  |
+| iteration 0                                | (`instance_failed`), at most twice per task                    |
+| Registered run whose instance died after   | Held as `INSTANCE_FAILED`: restarting would reset the revision |
+| consuming revisions, or a third crash      | budget                                                         |
 | Same key after a released, unstarted claim | 200 with the original id and status `not_started`              |
+
+### Holds and explicit resolution
+
+Every `paused`/`denied` run records `workflow_runs.hold_reason`. A hold is final: the run row
+cannot change afterwards, and the claim stays unreleased, so the task cannot start a new
+workflow under any idempotency key. Only an explicit resolution releases it:
+
+```http
+POST /orgs/{orgId}/workflow-runs/{runId}/resolution
+Authorization: Bearer <session>      X-Idempotency-Key: <key>
+{ "hold_reason": "LOOP_GUARD" }      // must equal the recorded reason
+```
+
+| Hold reason                                                   | Policy              | Who may resolve                                                                                 |
+| ------------------------------------------------------------- | ------------------- | ----------------------------------------------------------------------------------------------- |
+| `LOOP_GUARD`, `SECURITY_DENIED`, `APPROVAL_DENIED`            | `owner_human`       | The organization's human owner only (`organization.policy.manage`)                              |
+| `TIMEOUT`, `EVIDENCE_TIMEOUT`, `QA_FAILED`, `INSTANCE_FAILED` | `workflow_approver` | Holders of `workflow.approve` (owner, executive); an employee cannot resolve a run they started |
+
+Managers hold neither permission. Each task allows at most three resolutions in total. After
+that, the task needs a different decision (for example cancellation) rather than another run.
+The resolution row (`workflow_run_resolutions`) is the insert-only audit record: run, task,
+reason, policy, actor, and time. It is written in the same D1 batch as the claim release.
+Resolving does not start a run. The next start must pass every eligibility check again and
+begins a new, fully governed run.
+
+The database enforces the policy independently of the API. The claim trigger allows a release
+only for `completed` (run complete), `never_registered` (no run row), `instance_failed`
+(`INSTANCE_FAILED` at iteration 0, fewer than two per task), or `resolved` (a resolution row
+exists). The resolution trigger checks the held state, the reason/policy mapping, owner
+identity, separation of duties, and the budget.
 
 ### Governance
 
@@ -121,25 +156,29 @@ grants no review or approval power.
 
 ## Regression tests
 
-`apps/api/test/workflow-start-entrypoint.test.ts` (7) and
+`apps/api/test/workflow-start-entrypoint.test.ts` (7), `workflow-hold-resolution.test.ts` (3), and
 `apps/api/test/production-task-workflow.test.ts` (+1):
 
-| Required case                        | Test evidence                                                    |
-| ------------------------------------ | ---------------------------------------------------------------- |
-| Authorized start → PASS              | 201, run registers `running`, claim actor is the session owner   |
-| Unauthorized start → DENY            | anonymous 401, QA 403, worker 403                                |
-| Wrong organization → DENY            | foreign session 401, foreign org path 404                        |
-| Wrong task/artifact relationship     | foreign artifact 404, sibling task 409 `ARTIFACT_TASK_MISMATCH`  |
-| Wrong artifact version → DENY        | future and superseded versions 409 `ARTIFACT_VERSION_STALE`      |
-| Duplicate request → same workflow    | 200, same id, `duplicate: true`; reused key 409                  |
-| Concurrent start → no duplicate      | 3 parallel requests → exactly one 201, one claim, one instance   |
-| Workflow event before evidence       | wakeups without stored evidence leave stage `qa_review`          |
-| Authorized QA evidence → advance     | QA PASS → `security`; security PASS → `waiting_for_approval`     |
-| Forged evidence → cannot advance     | worker review 403, forged human-approval wakeup ignored          |
-| Human approval missing → no complete | remains `waiting_for_approval` until owner HTTP final approval   |
-| Restart/retry → recoverable          | stranded claim reconciled; denied run released; new run admitted |
-| Untraceable instance                 | direct `create()` without claim → `errored`, no run row          |
-| Dead instance                        | errored-unregistered and terminated-registered runs release task |
+| Required case                         | Test evidence                                                                                                             |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Authorized start → PASS               | 201, run registers `running`, claim actor is the session owner                                                            |
+| Unauthorized start → DENY             | anonymous 401, QA 403, worker 403                                                                                         |
+| Wrong organization → DENY             | foreign session 401, foreign org path 404                                                                                 |
+| Wrong task/artifact relationship      | foreign artifact 404, sibling task 409 `ARTIFACT_TASK_MISMATCH`                                                           |
+| Wrong artifact version → DENY         | future and superseded versions 409 `ARTIFACT_VERSION_STALE`                                                               |
+| Duplicate request → same workflow     | 200, same id, `duplicate: true`; reused key 409                                                                           |
+| Concurrent start → no duplicate       | 3 parallel requests → exactly one 201, one claim, one instance                                                            |
+| Workflow event before evidence        | wakeups without stored evidence leave stage `qa_review`                                                                   |
+| Authorized QA evidence → advance      | QA PASS → `security`; security PASS → `waiting_for_approval`                                                              |
+| Forged evidence → cannot advance      | worker review 403, forged human-approval wakeup ignored                                                                   |
+| Human approval missing → no complete  | remains `waiting_for_approval` until owner HTTP final approval                                                            |
+| Restart/retry → recoverable           | stranded claim reconciled; denied run held until resolved, then a new run admitted                                        |
+| LOOP_GUARD cannot be reset by Manager | real 8-revision loop → held; new keys 409; manager/executive resolution 403; owner resolution audited, then new run       |
+| TIMEOUT policy and budget             | forced event timeout → held; starter cannot self-resolve; approvers resolve; 4th resolution `RESOLUTION_BUDGET_EXHAUSTED` |
+| Failed instance after revisions       | terminated at iteration 1 → held `INSTANCE_FAILED`, released only by resolution                                           |
+| DB enforcement (SQLite)               | `scripts/test-migrations.py` `WorkflowHoldPolicyTests` (5)                                                                |
+| Untraceable instance                  | direct `create()` without claim → `errored`, no run row                                                                   |
+| Dead instance                         | errored-unregistered and terminated-registered runs release task                                                          |
 
 Existing direct-binding tests now write the same claim with a fixture
 (`claimWorkflowStart`) before `create()`, because unclaimed instances are rejected by design.

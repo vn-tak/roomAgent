@@ -58,6 +58,16 @@ type WorkflowRunStatus =
 type WorkflowStage =
   "worker_submit" | "qa_review" | "revision" | "security" | "human_approval" | "complete";
 
+// Recorded on paused/denied runs; the start entrypoint never auto-releases these.
+export type HoldReason =
+  | "LOOP_GUARD"
+  | "TIMEOUT"
+  | "EVIDENCE_TIMEOUT"
+  | "QA_FAILED"
+  | "SECURITY_DENIED"
+  | "APPROVAL_DENIED"
+  | "INSTANCE_FAILED";
+
 type CompletionPolicy = "NONE" | "ARTIFACT_APPROVED" | "QA_SECURITY" | "HUMAN_FINAL";
 
 interface ProductionPlan {
@@ -136,7 +146,7 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
         }
         if (review.result !== "REVISION_REQUIRED") {
           await step.do(`qa-failed-${iteration}`, async () => {
-            await this.advance(runId, plan.orgId, "denied", "qa_review", iteration);
+            await this.advance(runId, plan.orgId, "denied", "qa_review", iteration, "QA_FAILED");
             throw new NonRetryableError("QA_FAILED");
           });
           throw new NonRetryableError("QA_FAILED");
@@ -145,7 +155,7 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
         iteration += 1;
         if (iteration >= MAX_WORKFLOW_ITERATIONS) {
           await step.do(`revision-cap-${iteration}`, async () => {
-            await this.advance(runId, plan.orgId, "paused", "revision", iteration);
+            await this.advance(runId, plan.orgId, "paused", "revision", iteration, "LOOP_GUARD");
             throw new NonRetryableError("LOOP_GUARD");
           });
           throw new NonRetryableError("LOOP_GUARD");
@@ -170,7 +180,7 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
       );
       if (security.decision !== "PASS") {
         await step.do("security-denied", async () => {
-          await this.advance(runId, plan.orgId, "denied", "security", iteration);
+          await this.advance(runId, plan.orgId, "denied", "security", iteration, "SECURITY_DENIED");
           throw new NonRetryableError("SECURITY_DENIED");
         });
         throw new NonRetryableError("SECURITY_DENIED");
@@ -192,7 +202,14 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
       );
       if (human.decision !== "PASS") {
         await step.do("human-denied", async () => {
-          await this.advance(runId, plan.orgId, "denied", "human_approval", iteration);
+          await this.advance(
+            runId,
+            plan.orgId,
+            "denied",
+            "human_approval",
+            iteration,
+            "APPROVAL_DENIED",
+          );
           throw new NonRetryableError("APPROVAL_DENIED");
         });
         throw new NonRetryableError("APPROVAL_DENIED");
@@ -489,7 +506,7 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
       await step.waitForEvent(stepName, { type: eventType, timeout: "24 hours" });
     } catch {
       await step.do(`${stepName}-timeout`, async () => {
-        await this.advance(runId, orgId, "paused", stage, iteration);
+        await this.advance(runId, orgId, "paused", stage, iteration, "TIMEOUT");
         throw new NonRetryableError("TIMEOUT");
       });
       throw new NonRetryableError("TIMEOUT");
@@ -501,9 +518,9 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
     orgId: string,
     stage: WorkflowStage,
     iteration: number,
-    reason: string,
+    reason: HoldReason,
   ): Promise<never> {
-    await this.advance(runId, orgId, "paused", stage, iteration);
+    await this.advance(runId, orgId, "paused", stage, iteration, reason);
     throw new NonRetryableError(reason);
   }
 
@@ -513,13 +530,14 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
     status: WorkflowRunStatus,
     stage: WorkflowStage,
     iteration: number,
+    holdReason: HoldReason | null = null,
   ): Promise<void> {
     const updated = await this.env.DB.prepare(
       `UPDATE workflow_runs
-       SET status = ?, stage = ?, iteration = ?, updated_at = ?
+       SET status = ?, stage = ?, iteration = ?, hold_reason = ?, updated_at = ?
        WHERE org_id = ? AND id = ?`,
     )
-      .bind(status, stage, iteration, new Date().toISOString(), orgId, runId)
+      .bind(status, stage, iteration, holdReason, new Date().toISOString(), orgId, runId)
       .run();
     if (updated.meta.changes !== 1) {
       throw new NonRetryableError("TENANT_BOUNDARY");

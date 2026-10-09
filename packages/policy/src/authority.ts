@@ -56,6 +56,9 @@ const ACTION_PERMISSION: Readonly<Record<string, PermissionCode>> = {
   "security.block.override": "override.security",
   // Starting a governed workflow is task orchestration; no role gains a new permission.
   "workflow.start": "task.assign",
+  // Releasing a held workflow run; no role gains a new permission.
+  "workflow.resolve": "workflow.approve",
+  "workflow.resolve.limit": "organization.policy.manage",
 };
 
 const SELF_APPROVAL_ACTIONS = new Set(["artifact.approve", "artifact.final_approve"]);

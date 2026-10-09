@@ -38,9 +38,9 @@ POST /orgs/:orgId/human-sessions
        signature, iss = team domain, aud ∋ AUD tag, exp > now,
        nbf/iat ≤ now + 60 s, type = "app" when present, email + sub present
      else 401 ACCESS_IDENTITY_INVALID
-  3. human_identities lookup by (issuer, lower(email)), status active,
-     Access `sub` pinned on first use and required to match afterwards
-     else 403 IDENTITY_NOT_MAPPED / IDENTITY_DISABLED / IDENTITY_MISMATCH
+  3. human_identities lookup by (issuer, verified `sub`) provisioned in advance;
+     the token email must equal the provisioned email; status active
+     else 403 IDENTITY_NOT_MAPPED / IDENTITY_MISMATCH / IDENTITY_DISABLED
   4. OrganizationDO.issueAccessHumanSession(userId, identityId, ttl = 900 s)
        runtime.bind gate ⇒ only the organization owner; organization must be active
      else 403 PERMISSION_DENIED
@@ -68,8 +68,11 @@ DELETE /orgs/:orgId/human-sessions/current   (Authorization: Bearer hum_…) →
 | No permanent all-powerful token    | No bootstrap token exists                                              |
 | No unauthenticated bootstrap route | Every issuance requires a verified Access JWT and a mapped identity    |
 
-The Access subject is pinned on first verified use, so a later token with the same email but
-a different `sub` (for example a re-provisioned IdP account) is rejected. Signing keys are
+There is no first-use or email-only binding. The operator provisions the verified Access
+subject together with the email and an approval reference (`attestation_ref`), and the subject
+cannot change afterwards. A token carrying the provisioned email under any other `sub` (an
+email reassigned in the IdP, even before the owner's first login) is rejected with
+`IDENTITY_MISMATCH`. So is the provisioned `sub` under a different email. Signing keys are
 cached for 5 minutes. An unknown `kid` triggers at most one refresh per 30 seconds, which
 covers Access key rotation (every 6 weeks, previous key valid for 7 days) without letting
 requests force refetches.
@@ -80,14 +83,21 @@ requests force refetches.
    only, MFA required. Record the team domain and the application AUD tag.
 2. Set `vars.ACCESS_TEAM_DOMAIN` and `vars.ACCESS_AUD` in `apps/api/wrangler.staging.jsonc`
    through a reviewed change. They are configuration, not secrets.
-3. Map the operator after review:
+3. Obtain the operator's Access user ID (the JWT `sub`) from Cloudflare Zero Trust user
+   records, not from the operator. A second person verifies it against the approved change
+   ticket. Then map it:
 
    ```sql
    -- id: python3 -c 'import secrets; print("hid_" + secrets.token_hex(16))'
-   INSERT INTO human_identities (id, issuer, email, subject, user_id, status, created_at, updated_at)
-   VALUES ('hid_<32 hex>', 'https://<team>.cloudflareaccess.com', '<lower-case email>', NULL,
-           '<usr_… owner of the target organization>', 'active', <now>, <now>);
+   INSERT INTO human_identities
+     (id, issuer, email, subject, user_id, attestation_ref, status, created_at, updated_at)
+   VALUES ('hid_<32 hex>', 'https://<team>.cloudflareaccess.com', '<lower-case email>',
+           '<verified Access sub>', '<usr_… owner of the target organization>',
+           '<change ticket / approver reference>', 'active', <now>, <now>);
    ```
+
+   The database rejects a mapping without `subject` or `attestation_ref`. Only `status` can
+   change afterwards; a different subject needs a new, separately approved mapping.
 
    Run it with `wrangler d1 execute ai-company-os-staging --remote --file <reviewed.sql>` only
    after the D1 preflight passes.
@@ -103,20 +113,22 @@ is now audited too.
 
 ## Regression tests
 
-`apps/api/test/human-bootstrap.test.ts` (4). Tests sign tokens with a generated RSA key and
+`apps/api/test/human-bootstrap.test.ts` (6). Tests sign tokens with a generated RSA key and
 serve its JWKS through a `fetch` stub for the test team domain only.
 
-| Required case                      | Evidence                                                               |
-| ---------------------------------- | ---------------------------------------------------------------------- |
-| Verified owner → session issued    | 201, TTL ≤ 900 s, session resolves to the owner, audit `issued/access` |
-| Forged identity → DENY             | wrong signing key, tampered payload, `alg: none`, garbage → 401        |
-| Wrong Access audience → DENY       | 401                                                                    |
-| Expired identity token → DENY      | `exp` in the past, `nbf` in the future → 401                           |
-| Wrong organization → DENY          | mapped owner of org A against org B → 403; session for A denied in B   |
-| Session revoked → DENY             | revoke → principal DENY, second revoke 401, audit `issued, revoked`    |
-| Suspended/disabled identity → DENY | disabled mapping → issuance 403 and live session DENY                  |
-| Untrusted public request → DENY    | raw `cf-access-authenticated-user-email`/actor headers → 401           |
-| Reassigned email                   | same email, different `sub` → 403 `IDENTITY_MISMATCH`                  |
+| Required case                      | Evidence                                                                                                                           |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Verified owner → session issued    | 201, TTL ≤ 900 s, session resolves to the owner, audit `issued/access`                                                             |
+| Forged identity → DENY             | wrong signing key, tampered payload, `alg: none`, garbage → 401                                                                    |
+| Wrong Access audience → DENY       | 401                                                                                                                                |
+| Expired identity token → DENY      | `exp` in the past, `nbf` in the future → 401                                                                                       |
+| Wrong organization → DENY          | mapped owner of org A against org B → 403; session for A denied in B                                                               |
+| Session revoked → DENY             | revoke → principal DENY, second revoke 401, audit `issued, revoked`                                                                |
+| Suspended/disabled identity → DENY | disabled mapping → issuance 403 and live session DENY                                                                              |
+| Email reassigned before first use  | provisioned email + foreign `sub` as the first request → 403, no session, mapping unchanged; provisioned `sub` + other email → 403 |
+| Unattested mapping                 | insert without `subject` or `attestation_ref` rejected; subject update → `IDENTITY_IMMUTABLE`                                      |
+| Untrusted public request → DENY    | raw `cf-access-authenticated-user-email`/actor headers → 401                                                                       |
+| Reassigned email                   | same email, different `sub` → 403 `IDENTITY_MISMATCH`                                                                              |
 
 `apps/api/test/human-session.test.ts` (existing 3) still passes with audited RPC issuance.
 

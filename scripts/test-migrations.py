@@ -221,5 +221,115 @@ class Migration0013RecoveryTests(unittest.TestCase):
             "SELECT name FROM sqlite_master WHERE name = 'reviews_same_org'").fetchone())
 
 
+class WorkflowHoldPolicyTests(unittest.TestCase):
+    """Database-level enforcement of the 0015 hold/release policy, independent of the API."""
+
+    def setUp(self):
+        self.db = database()
+        apply(self.db, [m for m in MIGRATIONS if int(m.name[:4]) <= 10])
+        populate_0010(self.db)
+        apply(self.db, [m for m in MIGRATIONS if int(m.name[:4]) > 10])
+        self.serial = 0
+
+    def tearDown(self):
+        self.db.close()
+
+    def run_with_claim(self, status="running", reason=None, iteration=0, actor=("human", "usr_existing")):
+        self.serial += 1
+        run_id = "wfr_" + format(self.serial, "032x")
+        self.db.execute("""INSERT INTO workflow_start_claims VALUES
+            (?, 'org_existing', ?, 'art_existing', 1, ?, ?, ?, 'claimed', NULL, 'now', 'now')""",
+            (run_id, TASK_ID, actor[0], actor[1], f"key_{self.serial:08d}"))
+        self.db.execute("UPDATE workflow_start_claims SET state = 'created' WHERE id = ?", (run_id,))
+        self.db.execute("""INSERT INTO workflow_runs
+            (id, org_id, instance_id, task_id, artifact_id, artifact_version, status, stage,
+             iteration, created_at, updated_at)
+            VALUES (?, 'org_existing', ?, ?, 'art_existing', 1, 'running', 'qa_review', 0, 'now', 'now')""",
+            (run_id, run_id, TASK_ID))
+        if status != "running":
+            self.db.execute(
+                "UPDATE workflow_runs SET status = ?, hold_reason = ?, iteration = ? WHERE id = ?",
+                (status, reason, iteration, run_id))
+        return run_id
+
+    def release(self, run_id, reason):
+        self.db.execute(
+            "UPDATE workflow_start_claims SET state = 'released', release_reason = ? WHERE id = ?",
+            (reason, run_id))
+
+    def resolve(self, run_id, reason, policy, actor_type="human", actor_id="usr_existing"):
+        self.serial += 1
+        self.db.execute("""INSERT INTO workflow_run_resolutions VALUES
+            (?, 'org_existing', ?, ?, ?, ?, ?, ?, ?, 'now')""",
+            (f"evt_{self.serial}", run_id, TASK_ID, reason, policy, actor_type, actor_id,
+             f"resolve_{self.serial:06d}"))
+
+    def test_held_runs_need_a_matching_resolution(self):
+        run_id = self.run_with_claim("paused", "LOOP_GUARD", 8)
+        for reason in ("completed", "never_registered", "instance_failed", "resolved"):
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "WORKFLOW_RELEASE_DENIED"):
+                self.release(run_id, reason)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "RESOLUTION_POLICY"):
+            self.resolve(run_id, "LOOP_GUARD", "workflow_approver")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "RESOLUTION_POLICY"):
+            self.resolve(run_id, "LOOP_GUARD", "owner_human", "employee", "emp_existing")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "WORKFLOW_NOT_HELD"):
+            self.resolve(run_id, "TIMEOUT", "workflow_approver")
+        self.resolve(run_id, "LOOP_GUARD", "owner_human")
+        self.release(run_id, "resolved")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "WORKFLOW_IMMUTABLE"):
+            self.db.execute("UPDATE workflow_runs SET status = 'running', hold_reason = NULL WHERE id = ?", (run_id,))
+
+    def test_run_holds_are_final_and_carry_a_reason(self):
+        run_id = self.run_with_claim()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "WORKFLOW_HOLD_REASON"):
+            self.db.execute("UPDATE workflow_runs SET status = 'paused' WHERE id = ?", (run_id,))
+        self.db.execute(
+            "UPDATE workflow_runs SET status = 'paused', hold_reason = 'TIMEOUT' WHERE id = ?", (run_id,))
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "WORKFLOW_IMMUTABLE"):
+            self.db.execute("UPDATE workflow_runs SET hold_reason = 'INSTANCE_FAILED' WHERE id = ?", (run_id,))
+
+    def test_starter_cannot_resolve_their_own_run(self):
+        run_id = self.run_with_claim("paused", "TIMEOUT", actor=("employee", "emp_existing"))
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "RESOLUTION_POLICY"):
+            self.resolve(run_id, "TIMEOUT", "workflow_approver", "employee", "emp_existing")
+
+    def test_automatic_recovery_is_limited(self):
+        progressed = self.run_with_claim("paused", "INSTANCE_FAILED", 1)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "WORKFLOW_RELEASE_DENIED"):
+            self.release(progressed, "instance_failed")
+        self.resolve(progressed, "INSTANCE_FAILED", "workflow_approver")
+        self.release(progressed, "resolved")
+        for _ in range(2):
+            self.release(self.run_with_claim("paused", "INSTANCE_FAILED", 0), "instance_failed")
+        third = self.run_with_claim("paused", "INSTANCE_FAILED", 0)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "WORKFLOW_RELEASE_DENIED"):
+            self.release(third, "instance_failed")
+
+    def test_resolution_budget_per_task(self):
+        for _ in range(3):
+            run_id = self.run_with_claim("paused", "TIMEOUT")
+            self.resolve(run_id, "TIMEOUT", "workflow_approver")
+            self.release(run_id, "resolved")
+        fourth = self.run_with_claim("paused", "TIMEOUT")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "RESOLUTION_BUDGET_EXHAUSTED"):
+            self.resolve(fourth, "TIMEOUT", "workflow_approver")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "AUDIT_IMMUTABLE"):
+            self.db.execute("DELETE FROM workflow_run_resolutions")
+
+    def test_human_identity_requires_provisioned_subject(self):
+        insert = """INSERT INTO human_identities
+            (id, issuer, email, subject, user_id, attestation_ref, status, created_at, updated_at)
+            VALUES (?, 'https://team.cloudflareaccess.com', ?, ?, 'usr_existing', ?, 'active', 'now', 'now')"""
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute(insert, ("hid_" + "1" * 32, "a@b.test", None, "CHANGE-0001"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute(insert, ("hid_" + "2" * 32, "a@b.test", "sub-a", None))
+        self.db.execute(insert, ("hid_" + "3" * 32, "a@b.test", "sub-a", "CHANGE-0001"))
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "IDENTITY_IMMUTABLE"):
+            self.db.execute("UPDATE human_identities SET subject = 'sub-b'")
+        self.db.execute("UPDATE human_identities SET status = 'disabled'")
+
+
 if __name__ == "__main__":
     unittest.main()
