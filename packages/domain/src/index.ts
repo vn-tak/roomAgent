@@ -34,10 +34,19 @@ export type {
   AgentSessionRequest,
   Reachability,
 } from "./agent-adapter";
-export { MAX_WORKFLOW_ITERATIONS } from "./workflow";
+export {
+  MAX_WORKFLOW_ITERATIONS,
+  DEFAULT_TASK_BUDGETS,
+  taskBudgetExceeded,
+  type TaskBudgets,
+  type TaskBudgetName,
+} from "./workflow";
 export {
   MAX_HANDOFFS,
   TASK_COMMANDS,
+  TASK_COMPLETION_POLICIES,
+  isTaskCompletionPolicy,
+  type TaskCompletionPolicy,
   TASK_STATES,
   dependencyCycle,
   isTaskCommand,
@@ -50,6 +59,7 @@ export {
 export {
   MAX_ARTIFACT_BASE64,
   MAX_ARTIFACT_BYTES,
+  MAX_DIRECT_ARTIFACT_BYTES,
   artifactObjectKey,
   canonicalMediaType,
   isArtifactFilename,

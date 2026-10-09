@@ -3,6 +3,7 @@ import { isId } from "@ai-company/domain";
 export const ROOM_ENVELOPE_VERSION = 1;
 export const MAX_REPLAY = 100;
 export const MAX_MESSAGE_CHARS = 2000;
+export const MAX_MESSAGE_BYTES = 8000;
 
 export type RoomValue = string | number | boolean | null;
 
@@ -44,7 +45,10 @@ export function isKnownClientType(type: string): boolean {
 }
 
 export function parseClientMessage(raw: string): ClientMessage | null {
-  if (raw.length > 8000) {
+  if (
+    raw.length > MAX_MESSAGE_BYTES ||
+    new TextEncoder().encode(raw).byteLength > MAX_MESSAGE_BYTES
+  ) {
     return null;
   }
   let value: unknown;

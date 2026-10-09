@@ -1,6 +1,7 @@
 import type { GovernanceResult } from "@ai-company/artifact";
 import { isId, isReviewResult } from "@ai-company/domain";
 import type { Context, Hono } from "hono";
+import { resolveHttpPrincipal } from "./http-principal";
 
 type EnvVars = { Bindings: Env; Variables: { requestId: string } };
 type App = Hono<EnvVars>;
@@ -52,8 +53,8 @@ async function submit(
   const stub = c.env.ARTIFACT.getByName(`artifacts:${orgId}`);
   const actor = {
     orgId,
-    actorType: "employee" as const,
-    actorId: session.employeeId,
+    actorType: session.actorType,
+    actorId: session.actorId,
     idempotencyKey,
     artifactId,
     version: parsed.version,
@@ -71,33 +72,27 @@ async function openSession(
   c: GovernanceContext,
   orgId: string,
   scope: string,
-): Promise<{ ok: true; employeeId: string } | { ok: false; response: Response }> {
+): Promise<
+  { ok: true; actorType: "human" | "employee"; actorId: string } | { ok: false; response: Response }
+> {
   const requestId = c.get("requestId");
-  const header = c.req.header("authorization");
-  const employeeId = c.req.header("x-employee-id");
-  const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-  if (!employeeId || !isId(employeeId, "emp") || !/^[0-9a-f]{64}$/.test(token)) {
-    return {
-      ok: false,
-      response: c.json(errorBody(requestId, "SESSION_INVALID", "Session is not valid."), 401),
-    };
-  }
-  const verified = await c.env.AGENT.getByName(`agent:${orgId}:${employeeId}`).verify({
+  const principal = await resolveHttpPrincipal(
+    c.env,
     orgId,
-    employeeId,
-    token,
+    c.req.header("authorization"),
+    c.req.header("x-employee-id"),
     scope,
-  });
-  if (verified.decision === "DENY") {
+  );
+  if (principal.decision === "DENY" || !principal.actorType || !principal.actorId) {
     return {
       ok: false,
       response: c.json(
-        errorBody(requestId, verified.reason, "Session is not valid."),
-        sessionStatus(verified.reason),
+        errorBody(requestId, principal.reason, "Session is not valid."),
+        sessionStatus(principal.reason),
       ),
     };
   }
-  return { ok: true, employeeId };
+  return { ok: true, actorType: principal.actorType, actorId: principal.actorId };
 }
 
 async function readCommand(

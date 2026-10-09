@@ -234,6 +234,16 @@ describe("artifact pipeline", () => {
     expect(created.r2Key).not.toContain("shot17");
     await pump();
     expect(await eventCount(studio.org.id, "artifact.version.created")).toBe(0);
+    expect(await artifactStub(studio.org.id).outboxStateForTest()).toContainEqual(
+      expect.objectContaining({
+        status: "pending",
+        attempts: 1,
+        failureReason: "QUEUE_SEND_FAILED",
+      }),
+    );
+    await until(async () => {
+      expect(await eventCount(studio.org.id, "artifact.version.created")).toBe(1);
+    });
     const replay = await put(employeeActor(studio.org.id, worker.id), {
       key: "artifact_v1_01",
       roomId: room.id,
@@ -248,9 +258,7 @@ describe("artifact pipeline", () => {
       version: 1,
       duplicate: true,
     });
-    await until(async () => {
-      expect(await eventCount(studio.org.id, "artifact.version.created")).toBe(1);
-    });
+    expect(await eventCount(studio.org.id, "artifact.version.created")).toBe(1);
 
     const second = await put(owner, {
       key: "artifact_v2_01",

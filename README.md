@@ -8,7 +8,9 @@ Muse and CUE are replaceable execution runtimes. They are not the employee recor
 
 Phase 0 discovery through Phase 10 company POC records are in this repository. The six-agent company test ran locally on browser sessions. Muse and CUE were not contacted.
 
-Certification: `AI_COMPANY_OS_POC_PARTIAL`. The local gate `PHASE10_COMPANY_POC_PASS` is not a production certification.
+Historical certification: `AI_COMPANY_OS_POC_PARTIAL`. Architecture remediation v1 is implemented awaiting independent review (`ROOMAGENT_REMEDIATION_IMPLEMENTED_AWAITING_INDEPENDENT_REVIEW`); neither the historical POC gate nor remediation implies production, staging, or Muse readiness.
+
+- Remediation ledger: [docs/reports/architecture-remediation-v1.md](docs/reports/architecture-remediation-v1.md)
 
 - Current state: [docs/STATUS.md](docs/STATUS.md)
 - Remaining plan: [docs/PLAN.md](docs/PLAN.md)
@@ -18,11 +20,13 @@ Certification: `AI_COMPANY_OS_POC_PARTIAL`. The local gate `PHASE10_COMPANY_POC_
 ## Local checks
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
+pnpm --filter @ai-company/api types
 pnpm format
 pnpm lint
 pnpm typecheck
 pnpm test
+python3 scripts/test-migrations.py
 ```
 
 D1 is local-only. The database id in `apps/api/wrangler.jsonc` is a placeholder.

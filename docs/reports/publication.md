@@ -1,5 +1,13 @@
 # Publication report
 
+## Remediation review package
+
+The current review package is [architecture-remediation-v1.md](architecture-remediation-v1.md).
+It supersedes the baseline's known limitations only where backed by new tests.
+The original publication record below remains historical. Do not merge or deploy before independent review.
+
+## Historical baseline (superseded where noted)
+
 STATUS: `AI_COMPANY_OS_POC_PARTIAL`
 
 Repository: https://github.com/vn-tak/roomAgent

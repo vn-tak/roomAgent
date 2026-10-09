@@ -34,6 +34,19 @@ export const TASK_COMMANDS = [
 
 export type TaskCommandName = (typeof TASK_COMMANDS)[number];
 
+export const TASK_COMPLETION_POLICIES = [
+  "NONE",
+  "ARTIFACT_APPROVED",
+  "QA_SECURITY",
+  "HUMAN_FINAL",
+] as const;
+
+export type TaskCompletionPolicy = (typeof TASK_COMPLETION_POLICIES)[number];
+
+export function isTaskCompletionPolicy(value: string): value is TaskCompletionPolicy {
+  return (TASK_COMPLETION_POLICIES as readonly string[]).includes(value);
+}
+
 export const MAX_HANDOFFS = 8;
 
 const TERMINAL: ReadonlySet<TaskState> = new Set(["COMPLETED", "CANCELLED", "FAILED"]);

@@ -1,8 +1,9 @@
-import { isId } from "@ai-company/domain";
+import { sha256Hex, isId } from "@ai-company/domain";
 import { Hono } from "hono";
 import { registerArtifactRoutes } from "./artifacts-route";
 import { registerGovernanceRoutes } from "./governance-route";
 import { handleQueue } from "./events/consumer";
+import { resolveHttpPrincipal } from "./http-principal";
 
 export { AgentDO } from "@ai-company/agent";
 export { ArtifactDO } from "@ai-company/artifact";
@@ -29,6 +30,7 @@ app.use("*", async (c, next) => {
   c.set("requestId", requestId);
   await next();
   if (c.res.status !== 101) {
+    c.header("cache-control", "no-store");
     c.header("x-request-id", requestId);
   }
 });
@@ -68,6 +70,72 @@ app.get("/orgs/:orgId/rooms/:roomId/socket", async (c) => {
   }
   const stub = c.env.ROOM.getByName(`room:${orgId}:${roomId}`);
   return stub.fetch(c.req.raw);
+});
+
+app.get("/orgs/:orgId/rooms/:roomId/snapshot", async (c) => {
+  const requestId = c.get("requestId");
+  const orgId = c.req.param("orgId");
+  const roomId = c.req.param("roomId");
+  if (!isId(orgId, "org") || !isId(roomId, "room")) {
+    return c.json(notFoundBody(requestId, "Room was not found."), 404);
+  }
+  const principal = await resolveHttpPrincipal(
+    c.env,
+    orgId,
+    c.req.header("authorization"),
+    c.req.header("x-employee-id"),
+    "room.read",
+  );
+  if (principal.decision !== "ALLOW" || !principal.actorId || principal.actorType !== "employee") {
+    return c.json(
+      {
+        error: {
+          code: "SESSION_INVALID",
+          message: "Employee session is required.",
+          request_id: requestId,
+        },
+      },
+      401,
+    );
+  }
+  const snapshot = await c.env.ROOM.getByName(`room:${orgId}:${roomId}`).snapshot({
+    orgId,
+    roomId,
+    actorType: "employee",
+    actorId: principal.actorId,
+  });
+  if (snapshot.decision === "DENY") {
+    return c.json(
+      {
+        error: {
+          code: snapshot.reason,
+          message: "Room snapshot was rejected.",
+          request_id: requestId,
+        },
+      },
+      snapshot.reason === "TENANT_BOUNDARY" ? 404 : 403,
+    );
+  }
+  return c.json({
+    room_id: snapshot.roomId,
+    head_seq: snapshot.headSeq,
+    room: snapshot.room,
+    members: snapshot.members.map((m) => ({ employee_id: m.employeeId, joined_at: m.joinedAt })),
+    presence: snapshot.presence.map((p) => ({ employee_id: p.employeeId, state: p.state })),
+    tasks: snapshot.tasks.map((t) => ({
+      id: t.id,
+      title: t.title,
+      state: t.state,
+      assignee_id: t.assigneeId,
+      updated_at: t.updatedAt,
+    })),
+    artifacts: snapshot.artifacts.map((a) => ({
+      id: a.id,
+      task_id: a.taskId,
+      canonical_version: a.canonicalVersion,
+      updated_at: a.updatedAt,
+    })),
+  });
 });
 
 app.post("/orgs/:orgId/join", async (c) => {
@@ -118,6 +186,37 @@ app.post("/orgs/:orgId/join", async (c) => {
     },
     status,
   );
+});
+
+app.post("/j/:token", async (c) => {
+  const requestId = c.get("requestId");
+  const token = c.req.param("token");
+  if (!/^[0-9a-f]{64}$/.test(token)) {
+    return c.json(notFoundBody(requestId, "Join was not found."), 404);
+  }
+  const join = await c.env.DB.prepare(
+    `SELECT org_id, employee_id FROM join_codes WHERE code_hash = ?`,
+  )
+    .bind(await sha256Hex(token))
+    .first<{ org_id: string; employee_id: string }>();
+  if (!join) return c.json(notFoundBody(requestId, "Join was not found."), 404);
+  const result = await c.env.AGENT.getByName(`agent:${join.org_id}:${join.employee_id}`).redeem({
+    orgId: join.org_id,
+    employeeId: join.employee_id,
+    code: token,
+  });
+  if (result.decision === "DENY") {
+    return c.json(
+      { error: { code: result.reason, message: "Join was rejected.", request_id: requestId } },
+      result.reason === "THROTTLED" ? 429 : 403,
+    );
+  }
+  c.header("cache-control", "no-store");
+  return c.json({
+    session_id: result.sessionId,
+    token: result.token,
+    expires_at: result.expiresAt,
+  });
 });
 
 app.get("/orgs/:orgId/agents/:employeeId/socket", async (c) => {

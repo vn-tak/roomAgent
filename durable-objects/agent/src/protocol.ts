@@ -1,6 +1,7 @@
 import { isId } from "@ai-company/domain";
 
 export const AGENT_ENVELOPE_VERSION = 1;
+export const MAX_AGENT_MESSAGE_BYTES = 8000;
 
 export type AgentValue = string | number | boolean | null;
 
@@ -20,7 +21,10 @@ export interface AgentClientMessage {
 const CLIENT_TYPES = new Set(["session.hello", "heartbeat", "inbox.ack", "ping"]);
 
 export function parseAgentMessage(raw: string): AgentClientMessage | null {
-  if (raw.length > 8000) {
+  if (
+    raw.length > MAX_AGENT_MESSAGE_BYTES ||
+    new TextEncoder().encode(raw).byteLength > MAX_AGENT_MESSAGE_BYTES
+  ) {
     return null;
   }
   let value: unknown;

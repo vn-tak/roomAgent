@@ -10,7 +10,14 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { HUMAN_APPROVAL_EVENT, type ProductionTaskParams } from "../src/production-task-workflow";
+import {
+  ARTIFACT_VERSION_EVENT,
+  HUMAN_APPROVAL_EVENT,
+  QA_EVIDENCE_EVENT,
+  SECURITY_EVIDENCE_EVENT,
+  notifyProductionTaskEvidence,
+  type ProductionTaskParams,
+} from "../src/production-task-workflow";
 import {
   agentStub,
   artifactStub,
@@ -55,6 +62,7 @@ async function run(
     objective?: string;
     roomId?: string | null;
     dependsOn?: string[];
+    completionPolicy?: TaskCommand["completionPolicy"];
   },
 ): Promise<TaskResult> {
   return taskStub(actor.orgId).execute({
@@ -69,6 +77,7 @@ async function run(
     objective: fields.objective ?? null,
     roomId: fields.roomId ?? null,
     dependsOn: fields.dependsOn ?? [],
+    ...(fields.completionPolicy ? { completionPolicy: fields.completionPolicy } : {}),
   });
 }
 
@@ -91,6 +100,30 @@ async function storedTask(orgId: string, taskId: string) {
 async function count(orgId: string, sql: string): Promise<number> {
   const row = await env.DB.prepare(sql).bind(orgId).first<{ n: number }>();
   return row?.n ?? 0;
+}
+
+async function governanceHttp(
+  orgId: string,
+  artifactId: string,
+  employeeId: string | undefined,
+  token: string,
+  kind: "reviews" | "approvals" | "security-approvals",
+  key: string,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  return exports.default.fetch(
+    `https://company.local/orgs/${orgId}/artifacts/${artifactId}/${kind}`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        ...(employeeId ? { "x-employee-id": employeeId } : {}),
+        "x-idempotency-key": key,
+      },
+      body: JSON.stringify(body),
+    },
+  );
 }
 
 async function pump(): Promise<void> {
@@ -192,6 +225,20 @@ async function runStatus(orgId: string, runId: string): Promise<string | null> {
   return row?.status ?? null;
 }
 
+async function untilWorkflowStage(orgId: string, runId: string, stage: string): Promise<void> {
+  await vi.waitFor(
+    async () => {
+      const row = await env.DB.prepare(
+        `SELECT stage FROM workflow_runs WHERE org_id = ? AND id = ?`,
+      )
+        .bind(orgId, runId)
+        .first<{ stage: string }>();
+      expect(row?.stage).toBe(stage);
+    },
+    { timeout: 8_000, interval: 20 },
+  );
+}
+
 describe("AI STUDIO LAB company POC", () => {
   it("completes one creative artifact and rejects the authority attacks", async () => {
     const studio = await createStudio("AI STUDIO LAB");
@@ -233,9 +280,18 @@ describe("AI STUDIO LAB company POC", () => {
     const people = [ceo, manager, workerA, workerB, qa, security];
     const tokens = new Map<string, string>();
     for (const person of people) {
-      const opened = await openBrowserSession(studio.org, person.id);
+      const scopes = ["room.read", "room.message.send"];
+      if (person.id === qa.id) scopes.push("artifact.review");
+      if (person.id === security.id) scopes.push("security.approve");
+      const opened = await openBrowserSession(studio.org, person.id, scopes);
       tokens.set(person.id, opened.token);
     }
+    const humanSession = await organizationStub(studio.org.id).issueHumanSession({
+      ...owner,
+      ttlSeconds: 600,
+    });
+    expect(humanSession.decision).toBe("ALLOW");
+    const humanToken = humanSession.token ?? "";
 
     const orgName = await env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`)
       .bind(studio.org.id)
@@ -405,6 +461,7 @@ describe("AI STUDIO LAB company POC", () => {
       title: "PROJECT POC-001",
       objective: GOAL,
       roomId: room.id,
+      completionPolicy: "QA_SECURITY",
     });
     expect(created).toMatchObject({ decision: "ALLOW", state: "CREATED" });
     const taskId = created.taskId ?? "";
@@ -484,7 +541,19 @@ describe("AI STUDIO LAB company POC", () => {
           employeeId: workerA.id,
         })
       ).currentTaskId,
-    ).toBeNull();
+    ).toBe(taskId);
+    expect(
+      (
+        await agentStub(studio.org.id, workerA.id).snapshot({
+          orgId: studio.org.id,
+          employeeId: workerA.id,
+        })
+      ).availability,
+    ).toBe("BUSY");
+    await runInDurableObject(agentStub(studio.org.id, workerA.id), (_instance, state) => {
+      const rows = state.storage.sql.exec<{ state: string }>(`SELECT state FROM inbox`).toArray();
+      expect(rows.map((row) => row.state)).toEqual(["ACKNOWLEDGED"]);
+    });
     expect((await run(workerActor, "start", { key: "poc_start_work1", taskId })).state).toBe(
       "WORKING",
     );
@@ -497,93 +566,138 @@ describe("AI STUDIO LAB company POC", () => {
     expect((await run(workerActor, "submit", { key: "poc_submit_wrk1", taskId })).state).toBe(
       "REVIEW",
     );
-    const rejected: GovernanceResult = await artifactStub(studio.org.id).review({
-      orgId: studio.org.id,
-      actorType: "employee",
-      actorId: qa.id,
-      idempotencyKey: "poc_qa_reject1",
-      artifactId,
-      version: 1,
-      result: "REVISION_REQUIRED",
-    });
-    expect(rejected).toMatchObject({ decision: "ALLOW", result: "REVISION_REQUIRED" });
-    expect(
-      (await run(qaActor, "request_revision", { key: "poc_task_revise1", taskId })).state,
-    ).toBe("REVISION");
-    expect((await run(workerActor, "start", { key: "poc_start_rev01", taskId })).state).toBe(
-      "WORKING",
-    );
-    const versionTwo = await artifactStub(studio.org.id).put(
-      putBytes(workerA.id, studio.org.id, "poc_art_v2_put1", room.id, taskId, artifactId, "poc v2"),
-    );
-    expect(versionTwo).toMatchObject({ decision: "ALLOW", version: 2 });
-    expect((await run(workerActor, "submit", { key: "poc_submit_rev1", taskId })).state).toBe(
-      "REVIEW",
-    );
-
-    const workerFinal: GovernanceResult = await artifactStub(studio.org.id).finalize({
-      orgId: studio.org.id,
-      actorType: "employee",
-      actorId: workerA.id,
-      idempotencyKey: "poc_worker_fin1",
-      artifactId,
-      version: 2,
-    } satisfies ArtifactFinalize);
-    expect(workerFinal).toMatchObject({ decision: "DENY", reason: "NO_PERMISSION" });
-    const managerOverride = await org.overrideSecurityBlock({
-      ...managerActor,
-      blockId: `blk_${"ab".repeat(16)}`,
-      reason: "POC",
-    });
-    expect(managerOverride).toMatchObject({ decision: "DENY", reason: "NO_PERMISSION" });
-    const securityEdit = await artifactStub(studio.org.id).put(
-      putBytes(security.id, studio.org.id, "poc_sec_modify1", room.id, taskId, artifactId, "nope"),
-    );
-    expect(securityEdit).toMatchObject({ decision: "DENY", reason: "NO_PERMISSION" });
-    expect(
-      await count(
-        studio.org.id,
-        `SELECT COUNT(*) AS n FROM approvals WHERE org_id = ? AND artifact_id = '${artifactId}'`,
-      ),
-    ).toBe(0);
-    expect(
-      await count(
-        studio.org.id,
-        `SELECT COUNT(*) AS n FROM artifact_versions WHERE org_id = ? AND artifact_id = '${artifactId}'`,
-      ),
-    ).toBe(2);
-
     const other = await createStudio("ORG B");
     const runId = createId("wfr");
     const watched = await introspectWorkflowInstance(env.PRODUCTION_TASK, runId);
     try {
+      const taskTrace = await env.DB.prepare(
+        `SELECT correlation_id FROM tasks WHERE org_id = ? AND id = ?`,
+      )
+        .bind(studio.org.id, taskId)
+        .first<{ correlation_id: string }>();
+      expect(taskTrace?.correlation_id).toMatch(/^corr_/);
       const params: ProductionTaskParams = {
         orgId: studio.org.id,
         taskId,
         artifactId,
-        version: 2,
+        version: 1,
         roomId: room.id,
-        workerEmployeeId: workerA.id,
-        qaEmployeeId: qa.id,
-        securityEmployeeId: security.id,
-        qaResults: ["PASS"],
-        correlationId: createId("corr"),
+        correlationId: taskTrace?.correlation_id ?? "",
       };
       await env.PRODUCTION_TASK.create({ id: runId, params });
+      await untilWorkflowStage(studio.org.id, runId, "qa_review");
+
+      const rejected = await governanceHttp(
+        studio.org.id,
+        artifactId,
+        qa.id,
+        tokens.get(qa.id) ?? "",
+        "reviews",
+        "poc_qa_reject1",
+        { result: "REVISION_REQUIRED", version: 1 },
+      );
+      expect(rejected.status).toBe(201);
+      await notifyProductionTaskEvidence(env, studio.org.id, artifactId, QA_EVIDENCE_EVENT);
+      await untilWorkflowStage(studio.org.id, runId, "revision");
+      expect(
+        (await run(qaActor, "request_revision", { key: "poc_task_revise1", taskId })).state,
+      ).toBe("REVISION");
+      expect((await run(workerActor, "start", { key: "poc_start_rev01", taskId })).state).toBe(
+        "WORKING",
+      );
+      const versionTwo = await artifactStub(studio.org.id).put(
+        putBytes(
+          workerA.id,
+          studio.org.id,
+          "poc_art_v2_put1",
+          room.id,
+          taskId,
+          artifactId,
+          "poc v2",
+        ),
+      );
+      expect(versionTwo).toMatchObject({ decision: "ALLOW", version: 2 });
+      expect((await run(workerActor, "submit", { key: "poc_submit_rev1", taskId })).state).toBe(
+        "REVIEW",
+      );
+      await notifyProductionTaskEvidence(env, studio.org.id, artifactId, ARTIFACT_VERSION_EVENT);
+      await untilWorkflowStage(studio.org.id, runId, "qa_review");
+
+      const workerFinal: GovernanceResult = await artifactStub(studio.org.id).finalize({
+        orgId: studio.org.id,
+        actorType: "employee",
+        actorId: workerA.id,
+        idempotencyKey: "poc_worker_fin1",
+        artifactId,
+        version: 2,
+      } satisfies ArtifactFinalize);
+      expect(workerFinal).toMatchObject({ decision: "DENY", reason: "NO_PERMISSION" });
+      const managerOverride = await org.overrideSecurityBlock({
+        ...managerActor,
+        blockId: `blk_${"ab".repeat(16)}`,
+        reason: "POC",
+      });
+      expect(managerOverride).toMatchObject({ decision: "DENY", reason: "NO_PERMISSION" });
+      const securityEdit = await artifactStub(studio.org.id).put(
+        putBytes(
+          security.id,
+          studio.org.id,
+          "poc_sec_modify1",
+          room.id,
+          taskId,
+          artifactId,
+          "nope",
+        ),
+      );
+      expect(securityEdit).toMatchObject({ decision: "DENY", reason: "NO_PERMISSION" });
+      expect(
+        await count(
+          studio.org.id,
+          `SELECT COUNT(*) AS n FROM approvals WHERE org_id = ? AND artifact_id = '${artifactId}'`,
+        ),
+      ).toBe(0);
+      expect(
+        await count(
+          studio.org.id,
+          `SELECT COUNT(*) AS n FROM artifact_versions WHERE org_id = ? AND artifact_id = '${artifactId}'`,
+        ),
+      ).toBe(2);
+
+      const qaPass = await governanceHttp(
+        studio.org.id,
+        artifactId,
+        qa.id,
+        tokens.get(qa.id) ?? "",
+        "reviews",
+        "poc_qa_pass_v2",
+        { result: "PASS", version: 2 },
+      );
+      expect(qaPass.status).toBe(201);
+      await notifyProductionTaskEvidence(env, studio.org.id, artifactId, QA_EVIDENCE_EVENT);
+      await untilWorkflowStage(studio.org.id, runId, "security");
+
+      const securityApproval = await governanceHttp(
+        studio.org.id,
+        artifactId,
+        security.id,
+        tokens.get(security.id) ?? "",
+        "security-approvals",
+        "poc_security_approve",
+        { version: 2 },
+      );
+      expect(securityApproval.status).toBe(201);
+      await notifyProductionTaskEvidence(env, studio.org.id, artifactId, SECURITY_EVIDENCE_EVENT);
       await vi.waitFor(
-        async () => {
-          expect(await runStatus(studio.org.id, runId)).toBe("waiting_for_approval");
-        },
+        async () => expect(await runStatus(studio.org.id, runId)).toBe("waiting_for_approval"),
         { timeout: 8_000, interval: 20 },
       );
-      const handle = await env.PRODUCTION_TASK.get(runId);
-      const waiting = await handle.status();
+      const waiting = await (await env.PRODUCTION_TASK.get(runId)).status();
       expect(waiting.status === "running" || waiting.status === "waiting").toBe(true);
       expect(waiting.output).toBeNull();
       expect(await runStatus(other.org.id, runId)).toBeNull();
       const reviews = await env.DB.prepare(
         `SELECT artifact_version, result FROM reviews
-         WHERE org_id = ? AND artifact_id = ? ORDER BY rowid`,
+         WHERE org_id = ? AND artifact_id = ? ORDER BY artifact_version`,
       )
         .bind(studio.org.id, artifactId)
         .all<{ artifact_version: number; result: string }>();
@@ -591,23 +705,29 @@ describe("AI STUDIO LAB company POC", () => {
         { artifact_version: 1, result: "REVISION_REQUIRED" },
         { artifact_version: 2, result: "PASS" },
       ]);
-      const securityApproval = await env.DB.prepare(
-        `SELECT kind, decision FROM approvals WHERE org_id = ? AND artifact_id = ? ORDER BY rowid`,
-      )
-        .bind(studio.org.id, artifactId)
-        .all<{ kind: string; decision: string }>();
-      expect(securityApproval.results).toEqual([{ kind: "security", decision: "PASS" }]);
       expect((await storedTask(studio.org.id, taskId))?.state).toBe("REVIEW");
-      await handle.sendEvent({
+      await (
+        await env.PRODUCTION_TASK.get(runId)
+      ).sendEvent({
         type: HUMAN_APPROVAL_EVENT,
-        payload: {
-          actorType: "human",
-          actorId: studio.org.createdByUserId,
-          decision: "ALLOW",
-        },
+        payload: { actorType: "human", actorId: studio.org.createdByUserId, decision: "ALLOW" },
       });
+      await pump();
+      expect(await runStatus(studio.org.id, runId)).toBe("waiting_for_approval");
+
+      const final = await governanceHttp(
+        studio.org.id,
+        artifactId,
+        undefined,
+        humanToken,
+        "approvals",
+        "poc_human_final",
+        { version: 2 },
+      );
+      expect(final.status).toBe(201);
+      await notifyProductionTaskEvidence(env, studio.org.id, artifactId, HUMAN_APPROVAL_EVENT);
       await watched.waitForStatus("complete");
-      expect(await watched.getOutput()).toEqual({ outcome: "COMPLETE", iteration: 0 });
+      expect(await watched.getOutput()).toEqual({ outcome: "COMPLETE", iteration: 1 });
       expect(await runStatus(studio.org.id, runId)).toBe("complete");
       const approvals = await env.DB.prepare(
         `SELECT kind, decision, reason FROM approvals
@@ -642,14 +762,30 @@ describe("AI STUDIO LAB company POC", () => {
       employeeId: workerA.id,
       before: "2999-01-01T00:00:00.000Z",
     });
-    expect(swept).toMatchObject({ decision: "ALLOW", expired: 1 });
-    const degraded = await agentStub(studio.org.id, workerA.id).snapshot({
+    expect(swept).toMatchObject({ decision: "ALLOW", expired: 0 });
+    const afterCompletion = await agentStub(studio.org.id, workerA.id).snapshot({
       orgId: studio.org.id,
       employeeId: workerA.id,
     });
-    expect(degraded.availability).toBe("DEGRADED");
-    expect(degraded.reachability).toBe("BROWSER_CONNECTED");
-    expect(degraded.currentTaskId).toBeNull();
+    expect(afterCompletion.availability).toBe("IDLE");
+    expect(afterCompletion.reachability).toBe("BROWSER_CONNECTED");
+    expect(afterCompletion.currentTaskId).toBeNull();
+    expect(
+      await agentStub(studio.org.id, workerA.id).applyCanonicalTaskAck({
+        orgId: studio.org.id,
+        employeeId: workerA.id,
+        taskId,
+        idempotencyKey: "poc_late_completed_ack",
+      }),
+    ).toMatchObject({ decision: "ALLOW" });
+    expect(
+      (
+        await agentStub(studio.org.id, workerA.id).snapshot({
+          orgId: studio.org.id,
+          employeeId: workerA.id,
+        })
+      ).currentTaskId,
+    ).toBeNull();
     expect((await storedTask(studio.org.id, taskId))?.state).toBe("COMPLETED");
 
     const loop = await run(ceoActor, "create", {

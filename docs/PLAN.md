@@ -28,32 +28,29 @@ State: `AI_COMPANY_OS_POC_PARTIAL`.
 
 `AI_COMPANY_OS_POC_CERTIFIED` stays unissued. The master-plan success list includes a real Muse join. This repository proved the same company flow with browser sessions and left Muse unimplemented on purpose. A browser row labeled `muse` would be a false session, so that shortcut is rejected.
 
-## Still open
+## Remediation and next gates
 
-These items are specified and not built. They are the remaining product plan. They are not started in the publication commit.
+Architecture remediation v1 closes the independent review findings without a rewrite.
+Its implementation ledger and local/CI evidence are in
+[architecture-remediation-v1.md](reports/architecture-remediation-v1.md).
+Independent review is the next gate. No merge, deploy, remote resource creation,
+UI work, or live Muse/CUE integration is part of this task.
 
-1. Human session. HTTP mutations for a person stay off until a real human session exists. Today the owner acts through trusted Durable Object RPC and the store. `x-employee-id` is not authority.
-2. Minimum human UI after that session: organizations, employees, departments, rooms, tasks, artifacts, approvals, security blocks, audit, and runtime sessions. Function before visual polish.
-3. Muse adapter as a replaceable runtime. The employee record stays the authority. The adapter must not store a Muse password, cookie, or provider credential, and it must not bypass a provider login wall.
-4. CUE adapter on the same rule. The baseline company proof does not require CUE.
-5. Remaining runaway limits. Implemented today: `max_handoffs` 8 and `max_workflow_iterations` 8. Not implemented: `max_active_tasks_per_agent`, `max_agent_messages_per_task`, `max_task_retries`, `org_daily_action_budget`, and `agent_action_budget`.
-6. One asserted audit replay of the company path. Domain events and audit rows are append-only. The company test does not yet reconstruct every step from `audit_events` alone.
-7. Vectorize stays unused. Add it only when a retrieval feature has a tenant-scoped design. It is not required for the control plane.
-8. Staging deploy. Create a new staging D1 database, R2 bucket, queues, and workflow on purpose. Then point Wrangler at those new ids. The placeholder id `00000000-0000-4000-8000-000000000001` must not be applied remotely. Existing account databases and buckets stay out of scope.
+Remaining product work after independent review requires a new explicit request:
+human identity-provider/login integration (the minimal session has trusted internal
+issuance only), human UI, approved runtime adapters, and any staging/production
+provisioning. Vectorize remains unused. This remediation is not production certification.
 
-## Suggested order for the next session
+TaskDO and ArtifactDO remain per-organization MVP serialization domains
+(`tasks:{orgId}`, `artifacts:{orgId}`). Future scale may require project/task shards
+and per-artifact or artifact shards. No premature sharding is performed here.
 
-Do this only when someone explicitly asks to continue.
+## Next safe step
 
-1. Keep the current gates green.
-2. Add a human session and move owner mutations off raw RPC.
-3. Add the minimum UI against that session, and verify it in a browser.
-4. Add one provider adapter only with an explicit non-credential binding design.
-5. Add the remaining loop and budget limits with tests.
-6. Add the audit-replay assertion for `PROJECT POC-001`.
-7. Open a staging Cloudflare namespace that contains only AI Company OS resources, then deploy that namespace.
-
-A UI, a second workflow, Vectorize, or a deploy is out of scope until that session starts.
+Independent review of the remediation PR is next. Keep the branch unmerged and
+undeployed. Product work requires a new explicit request after review: human
+login integration, then any UI or approved runtime adapter. Budget guards and
+the bounded audit replay are part of this remediation, not deferred next-session work.
 
 ## Safety rules that stay in force
 

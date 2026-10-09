@@ -538,7 +538,12 @@ export class FoundationStore {
     }
   }
 
-  async assignEmployeeRole(orgId: string, employeeId: string, roleId: string): Promise<void> {
+  // Bootstrap only. Live role changes must go through OrganizationDO.assignRole().
+  async bootstrapAssignEmployeeRoleUnsafe(
+    orgId: string,
+    employeeId: string,
+    roleId: string,
+  ): Promise<void> {
     const org = this.org(orgId);
     const employee = await this.getEmployee(org, employeeId);
     if (!employee) {

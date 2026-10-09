@@ -441,6 +441,7 @@ describe("task engine", () => {
       key: "socket_create",
       title: "Socket",
       objective: "Ack from the room.",
+      roomId: room.id,
     });
     const socketTask = acked.taskId ?? "";
     await run(managerActor, "assign", {
@@ -472,6 +473,14 @@ describe("task engine", () => {
           employeeId: worker.id,
         })
       ).currentTaskId,
-    ).toBeNull();
+    ).toBe(socketTask);
+    expect(
+      (
+        await agentStub(studio.org.id, worker.id).snapshot({
+          orgId: studio.org.id,
+          employeeId: worker.id,
+        })
+      ).availability,
+    ).toBe("BUSY");
   });
 });

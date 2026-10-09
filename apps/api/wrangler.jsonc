@@ -58,7 +58,6 @@
         "max_batch_timeout": 0,
         "max_retries": 2,
         "retry_delay": 0,
-        "max_concurrency": 1,
         "dead_letter_queue": "ai-company-os-dead-letter",
       },
       {
@@ -67,7 +66,6 @@
         "max_batch_timeout": 0,
         "max_retries": 2,
         "retry_delay": 0,
-        "max_concurrency": 1,
         "dead_letter_queue": "ai-company-os-dead-letter",
       },
       {
@@ -75,7 +73,6 @@
         "max_batch_size": 10,
         "max_batch_timeout": 0,
         "max_retries": 0,
-        "max_concurrency": 1,
       },
     ],
   },

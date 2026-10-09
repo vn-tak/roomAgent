@@ -1,5 +1,21 @@
 # End-to-end company POC
 
+## Remediated company path
+
+The updated company test exercises canonical work acceptance, an externally produced
+QA revision followed by QA PASS, separate security approval, and stored human approval.
+Workflow notifications are wakeups, not authority. Task policies check the current
+linked artifact version's authoritative governance evidence.
+
+The audit replay regression reconstructs this bounded company path from authoritative
+audit/domain records and compares its final state with canonical records. It is not a
+claim of universal event sourcing or a complete D1 rebuild.
+
+See [the remediation report](../reports/architecture-remediation-v1.md) for verification.
+The earlier Phase 10 flow below records the original split ACK and scripted workflow.
+
+## Historical baseline (superseded where noted)
+
 Status: RUN locally in the Workers test runner (`apps/api/test/company-poc.test.ts`). Nothing was deployed.
 
 Organization: `AI STUDIO LAB`.

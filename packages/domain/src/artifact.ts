@@ -1,4 +1,5 @@
 export const MAX_ARTIFACT_BYTES = 1_048_576;
+export const MAX_DIRECT_ARTIFACT_BYTES = 100 * 1_048_576;
 export const MAX_ARTIFACT_BASE64 = 1_400_000;
 
 const MEDIA_TYPES = [

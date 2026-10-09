@@ -29,7 +29,7 @@ describe("roles and permissions", () => {
     });
     await studio.store.assignPermission(studio.org.id, role.id, "artifact.create");
     const employee = await hire(studio.store, studio.org.id, "Artist");
-    await studio.store.assignEmployeeRole(studio.org.id, employee.id, role.id);
+    await studio.store.bootstrapAssignEmployeeRoleUnsafe(studio.org.id, employee.id, role.id);
     expect(await studio.store.listEmployeePermissionCodes(studio.org.id, employee.id)).toEqual([
       "artifact.create",
     ]);
@@ -68,10 +68,10 @@ describe("roles and permissions", () => {
     const employee = await hire(left.store, left.org.id, "Worker");
     const foreignRole = await right.store.getRoleByCode(right.org.id, "manager");
     await expect(
-      left.store.assignEmployeeRole(left.org.id, employee.id, foreignRole?.id ?? ""),
+      left.store.bootstrapAssignEmployeeRoleUnsafe(left.org.id, employee.id, foreignRole?.id ?? ""),
     ).rejects.toBeInstanceOf(DomainError);
     await expect(
-      left.store.assignEmployeeRole(left.org.id, employee.id, foreignRole?.id ?? ""),
+      left.store.bootstrapAssignEmployeeRoleUnsafe(left.org.id, employee.id, foreignRole?.id ?? ""),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(await left.store.listEmployeePermissionCodes(left.org.id, employee.id)).toEqual([]);
   });
