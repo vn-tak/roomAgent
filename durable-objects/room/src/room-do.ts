@@ -91,9 +91,49 @@ interface AppliedEvent {
 type Presence = "online" | "away" | "offline";
 
 interface SocketAttachment {
+  authenticated: boolean;
+  authDeadlineAt: number;
+  employeeId?: string;
+  sessionId?: string;
+}
+
+interface AuthenticatedSocketAttachment extends SocketAttachment {
+  authenticated: true;
   employeeId: string;
   sessionId: string;
 }
+
+export interface RoomSnapshotCommand {
+  orgId: string;
+  roomId: string;
+  actorType: RoomActorType;
+  actorId: string;
+}
+
+export interface RoomSnapshot {
+  decision: "ALLOW" | "DENY";
+  reason: string;
+  roomId: string | null;
+  headSeq: number;
+  room: { id: string; name: string; status: string } | null;
+  members: Array<{ employeeId: string; joinedAt: string }>;
+  presence: Array<{ employeeId: string; state: string }>;
+  tasks: Array<{
+    id: string;
+    title: string;
+    state: string;
+    assigneeId: string | null;
+    updatedAt: string;
+  }>;
+  artifacts: Array<{
+    id: string;
+    taskId: string | null;
+    canonicalVersion: number;
+    updatedAt: string;
+  }>;
+}
+
+const WS_AUTH_TIMEOUT_MS = 10_000;
 
 const TASK_PERMISSION = {
   "task.available": "task.create",
@@ -149,7 +189,24 @@ export class RoomDO extends DurableObject<RoomEnv> {
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({
+      authenticated: false,
+      authDeadlineAt: Date.now() + WS_AUTH_TIMEOUT_MS,
+    } satisfies SocketAttachment);
+    await this.refreshAuthAlarm();
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = readSocketAttachment(socket);
+      if (attachment && !attachment.authenticated && attachment.authDeadlineAt <= now) {
+        this.send(socket, this.errorEnvelope("AUTH_TIMEOUT", "Session hello timed out."));
+        socket.close(4001, "authentication.timeout");
+      }
+    }
+    await this.refreshAuthAlarm();
   }
 
   async join(command: RoomMembershipCommand): Promise<RoomMutation> {
@@ -267,6 +324,33 @@ export class RoomDO extends DurableObject<RoomEnv> {
     if (!body || !key) {
       return { ...deny("INVALID_INPUT", this.seq()), event: null, duplicate: false };
     }
+    const existing = this.findIdempotent(command.actorId, key);
+    if (existing) {
+      return { ...allow(existing.seq), event: existing, duplicate: true };
+    }
+    if (command.actorType === "employee") {
+      const agent = await this.env.AGENT.getByName(
+        `agent:${command.orgId}:${command.actorId}`,
+      ).snapshot({
+        orgId: command.orgId,
+        employeeId: command.actorId,
+      });
+      if (agent.decision === "DENY") {
+        return { ...deny(agent.reason, this.seq()), event: null, duplicate: false };
+      }
+      if (agent.currentTaskId) {
+        const result = await this.env.TASK.getByName(`tasks:${command.orgId}`).recordAgentMessage({
+          orgId: command.orgId,
+          employeeId: command.actorId,
+          taskId: agent.currentTaskId,
+          expectedRoomId: command.roomId,
+          idempotencyKey: key,
+        });
+        if (result.decision === "DENY") {
+          return { ...deny(result.reason, this.seq()), event: null, duplicate: false };
+        }
+      }
+    }
     return this.publish({
       type: "message.created",
       actorType: command.actorType,
@@ -299,6 +383,14 @@ export class RoomDO extends DurableObject<RoomEnv> {
     if (!subject || !key) {
       return { ...deny("INVALID_INPUT", opened.seq), event: null, duplicate: false };
     }
+    const correlationId = await this.taskCorrelationId(
+      command.orgId,
+      subject.taskId,
+      command.roomId,
+    );
+    if (!correlationId) {
+      return { ...deny("ROOM_MISMATCH", opened.seq), event: null, duplicate: false };
+    }
     return this.publish({
       type: command.type,
       actorType: command.actorType,
@@ -309,6 +401,7 @@ export class RoomDO extends DurableObject<RoomEnv> {
         actor_type: command.actorType,
         task_id: subject.taskId,
         status: subject.status,
+        correlation_id: correlationId,
         at: new Date().toISOString(),
       },
       orgId: command.orgId,
@@ -333,6 +426,92 @@ export class RoomDO extends DurableObject<RoomEnv> {
       return { decision: "DENY", reason: "RESYNC_REQUIRED", seq: opened.seq, events: [] };
     }
     return { ...allow(opened.seq), events };
+  }
+
+  async snapshot(command: RoomSnapshotCommand): Promise<RoomSnapshot> {
+    const opened = await this.open(command, "room.read");
+    if (opened.decision === "DENY") {
+      return emptyRoomSnapshot(opened.reason, opened.seq);
+    }
+    const member = await this.requireMember(command);
+    if (member) {
+      return emptyRoomSnapshot(member.reason, member.seq);
+    }
+    const headSeq = this.seq();
+    const room = await this.env.DB.prepare(
+      `SELECT id, name, status FROM rooms WHERE org_id = ? AND id = ? AND status = 'active'`,
+    )
+      .bind(command.orgId, command.roomId)
+      .first<{ id: string; name: string; status: string }>();
+    if (!room) {
+      return emptyRoomSnapshot("TENANT_BOUNDARY", headSeq);
+    }
+    const members = await this.env.DB.prepare(
+      `SELECT employee_id, joined_at FROM room_memberships
+       WHERE org_id = ? AND room_id = ? AND status = 'active'
+       ORDER BY joined_at, employee_id`,
+    )
+      .bind(command.orgId, command.roomId)
+      .all<{ employee_id: string; joined_at: string }>();
+    const activeMembers = members.results.map((row) => ({
+      employeeId: row.employee_id,
+      joinedAt: row.joined_at,
+    }));
+    const memberIds = new Set(activeMembers.map((row) => row.employeeId));
+    const presence = this.ctx.storage.sql
+      .exec<{ employee_id: string; state: string }>(
+        `SELECT employee_id, state FROM presence ORDER BY employee_id`,
+      )
+      .toArray()
+      .filter((row) => memberIds.has(row.employee_id))
+      .map((row) => ({ employeeId: row.employee_id, state: row.state }));
+    const tasks = await this.env.DB.prepare(
+      `SELECT id, title, state, assignee_id, updated_at FROM tasks
+       WHERE org_id = ? AND room_id = ?
+         AND state NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'EXPIRED')
+       ORDER BY updated_at, id`,
+    )
+      .bind(command.orgId, command.roomId)
+      .all<{
+        id: string;
+        title: string;
+        state: string;
+        assignee_id: string | null;
+        updated_at: string;
+      }>();
+    const artifacts = await this.env.DB.prepare(
+      `SELECT id, task_id, canonical_version, updated_at FROM artifacts
+       WHERE org_id = ? AND room_id = ? ORDER BY id`,
+    )
+      .bind(command.orgId, command.roomId)
+      .all<{
+        id: string;
+        task_id: string | null;
+        canonical_version: number;
+        updated_at: string;
+      }>();
+    return {
+      decision: "ALLOW",
+      reason: "ALLOWED",
+      roomId: command.roomId,
+      headSeq,
+      room,
+      members: activeMembers,
+      presence,
+      tasks: tasks.results.map((row) => ({
+        id: row.id,
+        title: row.title,
+        state: row.state,
+        assigneeId: row.assignee_id,
+        updatedAt: row.updated_at,
+      })),
+      artifacts: artifacts.results.map((row) => ({
+        id: row.id,
+        taskId: row.task_id,
+        canonicalVersion: row.canonical_version,
+        updatedAt: row.updated_at,
+      })),
+    };
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -413,6 +592,7 @@ export class RoomDO extends DurableObject<RoomEnv> {
   async webSocketClose(ws: WebSocket): Promise<void> {
     const attachment = readAttachment(ws);
     if (!attachment) {
+      await this.refreshAuthAlarm();
       return;
     }
     const stillOpen = this.socketsFor(attachment.employeeId).some((socket) => socket !== ws);
@@ -501,7 +681,13 @@ export class RoomDO extends DurableObject<RoomEnv> {
       this.send(ws, this.errorEnvelope(reason, message));
       return;
     }
-    ws.serializeAttachment({ employeeId, sessionId: checked.sessionId } satisfies SocketAttachment);
+    ws.serializeAttachment({
+      authenticated: true,
+      authDeadlineAt: 0,
+      employeeId,
+      sessionId: checked.sessionId,
+    } satisfies SocketAttachment);
+    await this.refreshAuthAlarm();
     await this.changePresence(bound, employeeId, "online", ws);
     const head = this.seq();
     const events = this.replay(lastSeenSeq) ?? [];
@@ -520,7 +706,7 @@ export class RoomDO extends DurableObject<RoomEnv> {
   private async requireLive(
     ws: WebSocket,
     orgId: string,
-    attachment: SocketAttachment,
+    attachment: AuthenticatedSocketAttachment,
     scope: string,
   ): Promise<boolean> {
     const checked = await this.env.AGENT.getByName(
@@ -549,7 +735,7 @@ export class RoomDO extends DurableObject<RoomEnv> {
   private async clientTask(
     ws: WebSocket,
     bound: BoundRoom,
-    attachment: SocketAttachment,
+    attachment: AuthenticatedSocketAttachment,
     command: TaskCommandName,
     data: Record<string, unknown>,
   ): Promise<void> {
@@ -575,6 +761,7 @@ export class RoomDO extends DurableObject<RoomEnv> {
       objective: null,
       roomId: null,
       dependsOn: [],
+      expectedRoomId: bound.roomId,
     });
     if (result.reason === "SUSPENDED_AGENT_DENY") {
       this.revokeSockets(attachment.employeeId, "SUSPENDED_AGENT_DENY");
@@ -582,6 +769,11 @@ export class RoomDO extends DurableObject<RoomEnv> {
     }
     if (result.decision === "DENY" || !result.state || !result.taskId) {
       this.send(ws, this.errorEnvelope(result.reason, "Task command was rejected."));
+      return;
+    }
+    const correlationId = await this.taskCorrelationId(bound.orgId, result.taskId, bound.roomId);
+    if (!correlationId) {
+      this.send(ws, this.errorEnvelope("ROOM_MISMATCH", "Task command was rejected."));
       return;
     }
     const roomKey = `task_${key}`;
@@ -597,6 +789,7 @@ export class RoomDO extends DurableObject<RoomEnv> {
         actor_type: "employee",
         task_id: result.taskId,
         status: result.state,
+        correlation_id: correlationId,
         at: new Date().toISOString(),
       },
     });
@@ -724,6 +917,19 @@ export class RoomDO extends DurableObject<RoomEnv> {
       .bind(bound.orgId, bound.roomId)
       .first<{ id: string }>();
     return row !== null;
+  }
+
+  private async taskCorrelationId(
+    orgId: string,
+    taskId: string,
+    roomId: string,
+  ): Promise<string | null> {
+    const row = await this.env.DB.prepare(
+      `SELECT correlation_id FROM tasks WHERE org_id = ? AND id = ? AND room_id = ?`,
+    )
+      .bind(orgId, taskId, roomId)
+      .first<{ correlation_id: string }>();
+    return row?.correlation_id || null;
   }
 
   private async employeeStatus(
@@ -999,7 +1205,7 @@ export class RoomDO extends DurableObject<RoomEnv> {
   private broadcast(event: RoomEnvelope, except?: WebSocket): void {
     const text = JSON.stringify(event);
     for (const socket of this.ctx.getWebSockets()) {
-      if (socket === except || socket.readyState !== WebSocket.OPEN) {
+      if (socket === except || socket.readyState !== WebSocket.OPEN || !readAttachment(socket)) {
         continue;
       }
       socket.send(text);
@@ -1029,21 +1235,75 @@ export class RoomDO extends DurableObject<RoomEnv> {
       .getWebSockets()
       .filter((socket) => readAttachment(socket)?.employeeId === employeeId);
   }
+
+  private async refreshAuthAlarm(): Promise<void> {
+    const deadlines = this.ctx
+      .getWebSockets()
+      .map(readSocketAttachment)
+      .filter(
+        (attachment): attachment is SocketAttachment => !!attachment && !attachment.authenticated,
+      )
+      .map((attachment) => attachment.authDeadlineAt);
+    if (deadlines.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(Math.min(...deadlines));
+  }
 }
 
-function readAttachment(ws: WebSocket): SocketAttachment | null {
+function emptyRoomSnapshot(reason: string, headSeq: number): RoomSnapshot {
+  return {
+    decision: "DENY",
+    reason,
+    roomId: null,
+    headSeq,
+    room: null,
+    members: [],
+    presence: [],
+    tasks: [],
+    artifacts: [],
+  };
+}
+
+function readSocketAttachment(ws: WebSocket): SocketAttachment | null {
   const value: unknown = ws.deserializeAttachment();
   if (!value || typeof value !== "object") {
     return null;
   }
-  const record = value as { employeeId?: unknown; sessionId?: unknown };
-  if (typeof record.employeeId !== "string" || !isId(record.employeeId, "emp")) {
+  const record = value as Partial<SocketAttachment>;
+  if (
+    typeof record.authenticated !== "boolean" ||
+    typeof record.authDeadlineAt !== "number" ||
+    !Number.isFinite(record.authDeadlineAt)
+  ) {
     return null;
   }
-  if (typeof record.sessionId !== "string" || !isId(record.sessionId, "ses")) {
+  return {
+    authenticated: record.authenticated,
+    authDeadlineAt: record.authDeadlineAt,
+    ...(typeof record.employeeId === "string" ? { employeeId: record.employeeId } : {}),
+    ...(typeof record.sessionId === "string" ? { sessionId: record.sessionId } : {}),
+  };
+}
+
+function readAttachment(ws: WebSocket): AuthenticatedSocketAttachment | null {
+  const attachment = readSocketAttachment(ws);
+  if (!attachment || !attachment.authenticated) {
     return null;
   }
-  return { employeeId: record.employeeId, sessionId: record.sessionId };
+  if (typeof attachment.employeeId !== "string" || !isId(attachment.employeeId, "emp")) {
+    return null;
+  }
+  if (typeof attachment.sessionId !== "string" || !isId(attachment.sessionId, "ses")) {
+    return null;
+  }
+  return {
+    authenticated: true,
+    authDeadlineAt: attachment.authDeadlineAt,
+    employeeId: attachment.employeeId,
+    sessionId: attachment.sessionId,
+  };
 }
 
 function parseData(body: string): RoomData {

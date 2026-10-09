@@ -6,6 +6,8 @@ export type {
   RoomMessageCommand,
   RoomMutation,
   RoomReadCommand,
+  RoomSnapshot,
+  RoomSnapshotCommand,
   RoomTaskCommand,
 } from "./room-do";
 export type { RoomEnvelope } from "./protocol";
