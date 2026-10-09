@@ -14,6 +14,8 @@ import {
 interface AgentEnv {
   DB: D1Database;
   ORGANIZATION: DurableObjectNamespace<OrganizationDO>;
+  TASK: DurableObjectNamespace;
+  TEST_MIGRATIONS?: unknown;
 }
 
 type ActorType = "human" | "employee";
@@ -139,11 +141,91 @@ type MetaRow = {
 };
 
 interface SocketAttachment {
+  authenticated: boolean;
+  authDeadlineAt: number;
+  sessionId?: string;
+}
+
+interface AuthenticatedSocketAttachment extends SocketAttachment {
+  authenticated: true;
   sessionId: string;
+}
+
+interface TaskAckCommand {
+  orgId: string;
+  actorType: "employee";
+  actorId: string;
+  idempotencyKey: string;
+  command: "ack";
+  taskId: string;
+  assigneeId: null;
+  title: null;
+  objective: null;
+  roomId: null;
+  dependsOn: string[];
+  expectedRoomId: string | null;
+}
+
+interface TaskAckResult {
+  decision: "ALLOW" | "DENY";
+  reason: string;
+  taskId: string | null;
+  state: string | null;
+}
+
+interface PendingWorkAck {
+  [key: string]: string | number | null;
+  inbox_id: string;
+  task_id: string;
+  room_id: string | null;
+  idempotency_key: string;
+  canonical_acknowledged: number;
+  attempts: number;
+}
+
+export interface ApplyCanonicalTaskAckCommand {
+  orgId: string;
+  employeeId: string;
+  taskId: string;
+  idempotencyKey: string;
+}
+
+interface ProjectAcceptedTaskCommand {
+  orgId: string;
+  employeeId: string;
+  roomId: string | null;
+  taskId: string;
+}
+
+interface AcceptedTaskMarker {
+  [key: string]: string | null;
+  task_id: string;
+  room_id: string | null;
+}
+
+export interface WorkAckResult {
+  decision: "ALLOW" | "DENY";
+  reason: string;
 }
 
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const LEASE_MS = 30_000;
+const WS_AUTH_TIMEOUT_MS = 10_000;
+const WORK_ACK_RETRY_BASE_MS = 1_000;
+const WORK_ACK_RETRY_MAX_MS = 60_000;
+const ACCEPTED_TASK_STATES = new Set([
+  "ACKNOWLEDGED",
+  "WORKING",
+  "SUBMITTED",
+  "REVIEW",
+  "REVISION",
+  "APPROVED",
+  "COMPLETED",
+]);
+
+function isAcceptedTaskState(state: string): boolean {
+  return ACCEPTED_TASK_STATES.has(state);
+}
 
 function deny(reason: string): SessionCheck {
   return { decision: "DENY", reason, sessionId: null };
@@ -176,7 +258,28 @@ export class AgentDO extends DurableObject<AgentEnv> {
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({
+      authenticated: false,
+      authDeadlineAt: Date.now() + WS_AUTH_TIMEOUT_MS,
+    } satisfies SocketAttachment);
+    await this.refreshAlarm();
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = readSocketAttachment(socket);
+      if (attachment && !attachment.authenticated && attachment.authDeadlineAt <= now) {
+        this.send(
+          socket,
+          agentEnvelope("error", { code: "AUTH_TIMEOUT", message: "Session hello timed out." }),
+        );
+        socket.close(4001, "authentication.timeout");
+      }
+    }
+    await this.retryPendingWorkAcks();
+    await this.refreshAlarm();
   }
 
   async redeem(command: RedeemCommand): Promise<RedeemResult> {
@@ -269,6 +372,21 @@ export class AgentDO extends DurableObject<AgentEnv> {
     this.ctx.storage.transactionSync(() => {
       this.ensureMeta(command.orgId, command.employeeId);
     });
+    const currentTaskId = this.meta()?.current_task_id;
+    if (currentTaskId) {
+      const task = await this.env.DB.prepare(
+        `SELECT state, assignee_id FROM tasks WHERE org_id = ? AND id = ?`,
+      )
+        .bind(command.orgId, currentTaskId)
+        .first<{ state: string; assignee_id: string | null }>();
+      if (
+        !task ||
+        task.assignee_id !== command.employeeId ||
+        ["COMPLETED", "CANCELLED", "FAILED"].includes(task.state)
+      ) {
+        this.releaseTaskProjection(currentTaskId);
+      }
+    }
     const meta = this.meta();
     const session = this.activeSession();
     return {
@@ -306,6 +424,7 @@ export class AgentDO extends DurableObject<AgentEnv> {
     }
     let result: InboxResult = inboxDeny("INVALID_INPUT");
     let deliver: InboxRow | null = null;
+    let acknowledged: InboxRow | null = null;
     this.ctx.storage.transactionSync(() => {
       this.ensureMeta(command.orgId, command.employeeId);
       const existing = this.inboxByKey(key);
@@ -321,13 +440,15 @@ export class AgentDO extends DurableObject<AgentEnv> {
       }
       const inboxId = createId("inb");
       const at = new Date().toISOString();
+      const accepted =
+        type === "task" && taskId !== null ? this.acceptedTaskMarker(taskId, roomId) : null;
       const sockets = this.openSockets();
-      const state = sockets.length > 0 ? "DELIVERED" : "QUEUED";
-      const deliveredAt = state === "DELIVERED" ? at : null;
+      const state = accepted ? "ACKNOWLEDGED" : sockets.length > 0 ? "DELIVERED" : "QUEUED";
+      const deliveredAt = state === "QUEUED" ? null : at;
       this.ctx.storage.sql.exec(
         `INSERT INTO inbox (
           id, type, task_id, room_id, priority, state, body, idempotency_key, created_at, delivered_at, acknowledged_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         inboxId,
         type,
         taskId,
@@ -338,7 +459,15 @@ export class AgentDO extends DurableObject<AgentEnv> {
         key,
         at,
         deliveredAt,
+        accepted ? at : null,
       );
+      if (accepted && taskId) {
+        this.ctx.storage.sql.exec(
+          `UPDATE meta SET current_task_id = ?, availability = 'BUSY'`,
+          taskId,
+        );
+        this.deleteAcceptedTaskMarker(taskId, roomId);
+      }
       result = {
         decision: "ALLOW",
         reason: "ALLOWED",
@@ -346,8 +475,8 @@ export class AgentDO extends DurableObject<AgentEnv> {
         state,
         duplicate: false,
       };
-      if (state === "DELIVERED") {
-        deliver = {
+      if (state === "DELIVERED" || state === "ACKNOWLEDGED") {
+        const eventRow = {
           id: inboxId,
           type,
           task_id: taskId,
@@ -356,12 +485,121 @@ export class AgentDO extends DurableObject<AgentEnv> {
           state,
           body,
         };
+        if (state === "ACKNOWLEDGED") {
+          acknowledged = eventRow;
+        } else {
+          deliver = eventRow;
+        }
       }
     });
+    if (acknowledged) {
+      this.broadcast(agentEnvelope("inbox.acknowledged", inboxData(acknowledged)));
+    }
     if (deliver) {
       this.broadcast(agentEnvelope("inbox.delivered", inboxData(deliver)));
     }
     return result;
+  }
+
+  async applyCanonicalTaskAck(command: ApplyCanonicalTaskAckCommand): Promise<WorkAckResult> {
+    if (
+      !this.same(command.orgId, command.employeeId) ||
+      !isId(command.taskId, "task") ||
+      !/^[A-Za-z0-9_-]{8,80}$/.test(command.idempotencyKey)
+    ) {
+      return { decision: "DENY", reason: "TENANT_BOUNDARY" };
+    }
+    const task = await this.env.DB.prepare(
+      `SELECT room_id, state FROM tasks WHERE org_id = ? AND id = ? AND assignee_id = ?`,
+    )
+      .bind(command.orgId, command.taskId, command.employeeId)
+      .first<{ room_id: string | null; state: string }>();
+    if (task && ["COMPLETED", "CANCELLED", "FAILED"].includes(task.state)) {
+      this.releaseTaskProjection(command.taskId);
+      return { decision: "ALLOW", reason: "ALLOWED" };
+    }
+    if (!task || !isAcceptedTaskState(task.state)) {
+      return { decision: "DENY", reason: "TASK_NOT_ACCEPTED" };
+    }
+    return this.projectAcceptedTask({
+      orgId: command.orgId,
+      employeeId: command.employeeId,
+      taskId: command.taskId,
+      roomId: task.room_id,
+    });
+  }
+
+  private releaseTaskProjection(taskId: string): void {
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(`DELETE FROM accepted_tasks WHERE task_id = ?`, taskId);
+      this.ctx.storage.sql.exec(
+        `UPDATE meta SET current_task_id = NULL, availability = 'IDLE' WHERE current_task_id = ?`,
+        taskId,
+      );
+    });
+  }
+
+  private async projectAcceptedTask(command: ProjectAcceptedTaskCommand): Promise<WorkAckResult> {
+    if (
+      !this.same(command.orgId, command.employeeId) ||
+      !isId(command.taskId, "task") ||
+      (command.roomId !== null && !isId(command.roomId, "room"))
+    ) {
+      return { decision: "DENY", reason: "TENANT_BOUNDARY" };
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.ensureMeta(command.orgId, command.employeeId);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO accepted_tasks (task_id, room_id, accepted_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(task_id) DO UPDATE SET
+           room_id = excluded.room_id,
+           accepted_at = excluded.accepted_at`,
+        command.taskId,
+        command.roomId,
+        new Date().toISOString(),
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE meta SET current_task_id = ?, availability = 'BUSY'`,
+        command.taskId,
+      );
+    });
+    const rows = this.ctx.storage.sql
+      .exec<InboxRow>(
+        `SELECT id, type, task_id, room_id, priority, state, body FROM inbox
+         WHERE type = 'task' AND task_id = ? AND room_id IS ?
+           AND state IN ('QUEUED', 'DELIVERED', 'ACKNOWLEDGED')
+         ORDER BY created_at, id LIMIT 50`,
+        command.taskId,
+        command.roomId,
+      )
+      .toArray();
+    for (const row of rows) {
+      this.queueWorkAck(row, true);
+      try {
+        const projected = this.applyWorkAckProjection(row.id);
+        if (projected?.changed) {
+          this.broadcast(agentEnvelope("inbox.acknowledged", inboxData(projected.row)));
+        }
+      } catch {
+        this.scheduleWorkAckRetry(row.id);
+        await this.refreshAlarm();
+        return { decision: "DENY", reason: "ACK_PENDING" };
+      }
+    }
+    return { decision: "ALLOW", reason: "ALLOWED" };
+  }
+
+  async armProjectionFault(times: number): Promise<{ armed: boolean }> {
+    if (!this.testMode() || !Number.isInteger(times) || times < 0 || times > 8) {
+      return { armed: false };
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO projection_fault (id, remaining) VALUES (1, ?)
+       ON CONFLICT(id) DO UPDATE SET remaining = excluded.remaining`,
+      times,
+    );
+    return { armed: true };
   }
 
   async revokeSession(command: RevokeSessionCommand): Promise<SessionCheck> {
@@ -499,11 +737,12 @@ export class AgentDO extends DurableObject<AgentEnv> {
       );
       return;
     }
-    this.acknowledge(ws, inboxId);
+    await this.acknowledge(ws, inboxId);
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
     if (!readAttachment(ws)) {
+      await this.refreshAlarm();
       return;
     }
     if (this.openSockets().some((socket) => socket !== ws)) {
@@ -554,7 +793,12 @@ export class AgentDO extends DurableObject<AgentEnv> {
       availability,
       now,
     );
-    ws.serializeAttachment({ sessionId: checked.sessionId } satisfies SocketAttachment);
+    ws.serializeAttachment({
+      authenticated: true,
+      authDeadlineAt: 0,
+      sessionId: checked.sessionId,
+    } satisfies SocketAttachment);
+    await this.refreshAlarm();
     this.catchUp(ws, now);
     const current = this.meta();
     this.send(
@@ -584,38 +828,314 @@ export class AgentDO extends DurableObject<AgentEnv> {
     this.send(ws, agentEnvelope("heartbeat.ack", { lease_until: leaseUntil }));
   }
 
-  private acknowledge(ws: WebSocket, inboxId: string): void {
-    let row: InboxRow | null = null;
-    this.ctx.storage.transactionSync(() => {
-      const current = this.inboxById(inboxId);
-      if (!current || (current.state !== "DELIVERED" && current.state !== "ACKNOWLEDGED")) {
-        return;
-      }
-      if (current.state === "DELIVERED") {
-        const at = new Date().toISOString();
-        this.ctx.storage.sql.exec(
-          `UPDATE inbox SET state = 'ACKNOWLEDGED', acknowledged_at = ? WHERE id = ?`,
-          at,
-          inboxId,
-        );
-        if (current.type === "task" && current.task_id) {
-          this.ctx.storage.sql.exec(
-            `UPDATE meta SET current_task_id = ?, availability = 'BUSY'`,
-            current.task_id,
-          );
-        }
-      }
-      row = { ...current, state: "ACKNOWLEDGED" };
-    });
-    if (!row) {
+  private async acknowledge(ws: WebSocket, inboxId: string): Promise<void> {
+    const row = this.inboxById(inboxId);
+    if (!row || (row.state !== "DELIVERED" && row.state !== "ACKNOWLEDGED")) {
       this.send(
         ws,
         agentEnvelope("error", { code: "NOT_DELIVERED", message: "Inbox item is not delivered." }),
       );
       return;
     }
-    const acked: InboxRow = row;
-    this.send(ws, agentEnvelope("inbox.acknowledged", inboxData(acked)));
+    if (row.type !== "task") {
+      const projected = this.applyNonTaskAck(inboxId);
+      if (!projected) {
+        this.send(
+          ws,
+          agentEnvelope("error", {
+            code: "NOT_DELIVERED",
+            message: "Inbox item is not delivered.",
+          }),
+        );
+        return;
+      }
+      this.send(ws, agentEnvelope("inbox.acknowledged", inboxData(projected)));
+      return;
+    }
+    if (!row.task_id || !isId(row.task_id, "task")) {
+      this.send(ws, agentEnvelope("error", { code: "INVALID_INPUT", message: "Task is invalid." }));
+      return;
+    }
+    this.queueWorkAck(row, false);
+    await this.refreshAlarm();
+    let accepted: TaskAckResult;
+    try {
+      accepted = await this.executeCanonicalAck(row);
+    } catch {
+      this.scheduleWorkAckRetry(row.id);
+      await this.refreshAlarm();
+      this.send(
+        ws,
+        agentEnvelope("error", { code: "ACK_PENDING", message: "Work acceptance is pending." }),
+      );
+      return;
+    }
+    if (accepted.decision !== "ALLOW" || accepted.state !== "ACKNOWLEDGED") {
+      this.deletePendingWorkAck(row.id);
+      this.send(
+        ws,
+        agentEnvelope("error", { code: accepted.reason, message: "Work acceptance was rejected." }),
+      );
+      return;
+    }
+    this.markCanonicalAck(row.id);
+    const projected = this.inboxById(row.id);
+    if (projected?.state === "ACKNOWLEDGED") {
+      this.send(ws, agentEnvelope("inbox.acknowledged", inboxData(projected)));
+    } else {
+      this.scheduleWorkAckRetry(row.id);
+      await this.refreshAlarm();
+      this.send(
+        ws,
+        agentEnvelope("error", {
+          code: "ACK_PENDING",
+          message: "Work acceptance is pending projection.",
+        }),
+      );
+    }
+  }
+
+  private applyNonTaskAck(inboxId: string): InboxRow | null {
+    let result: InboxRow | null = null;
+    this.ctx.storage.transactionSync(() => {
+      const current = this.inboxById(inboxId);
+      if (!current || (current.state !== "DELIVERED" && current.state !== "ACKNOWLEDGED")) {
+        return;
+      }
+      if (current.state === "DELIVERED") {
+        this.ctx.storage.sql.exec(
+          `UPDATE inbox SET state = 'ACKNOWLEDGED', acknowledged_at = ? WHERE id = ?`,
+          new Date().toISOString(),
+          inboxId,
+        );
+      }
+      result = { ...current, state: "ACKNOWLEDGED" };
+    });
+    return result;
+  }
+
+  private queueWorkAck(row: InboxRow, canonicalAcknowledged: boolean): void {
+    if (!row.task_id) {
+      return;
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO work_ack_retries (
+         inbox_id, task_id, room_id, idempotency_key, canonical_acknowledged, attempts, next_attempt_at
+       ) VALUES (?, ?, ?, ?, ?, 0, ?)
+       ON CONFLICT(inbox_id) DO UPDATE SET
+         canonical_acknowledged = MAX(work_ack_retries.canonical_acknowledged, excluded.canonical_acknowledged),
+         next_attempt_at = excluded.next_attempt_at`,
+      row.id,
+      row.task_id,
+      row.room_id,
+      `inbox_work_ack_${row.id}`,
+      canonicalAcknowledged ? 1 : 0,
+      new Date().toISOString(),
+    );
+  }
+
+  private async executeCanonicalAck(row: InboxRow): Promise<TaskAckResult> {
+    const bound = this.bound();
+    if (!bound || !row.task_id) {
+      return { decision: "DENY", reason: "TENANT_BOUNDARY", taskId: null, state: null };
+    }
+    const stub = this.env.TASK.getByName(`tasks:${bound.orgId}`) as unknown as {
+      execute(command: TaskAckCommand): Promise<TaskAckResult>;
+    };
+    return stub.execute({
+      orgId: bound.orgId,
+      actorType: "employee",
+      actorId: bound.employeeId,
+      idempotencyKey: `inbox_work_ack_${row.id}`,
+      command: "ack",
+      taskId: row.task_id,
+      assigneeId: null,
+      title: null,
+      objective: null,
+      roomId: null,
+      dependsOn: [],
+      expectedRoomId: row.room_id,
+    });
+  }
+
+  private markCanonicalAck(inboxId: string): void {
+    this.ctx.storage.sql.exec(
+      `UPDATE work_ack_retries SET canonical_acknowledged = 1, next_attempt_at = ? WHERE inbox_id = ?`,
+      new Date().toISOString(),
+      inboxId,
+    );
+  }
+
+  private applyWorkAckProjection(inboxId: string): { row: InboxRow; changed: boolean } | null {
+    if (this.consumeProjectionFault()) {
+      throw new Error("Injected work acknowledgement projection failure.");
+    }
+    const bound = this.bound();
+    if (!bound) {
+      return null;
+    }
+    let result: { row: InboxRow; changed: boolean } | null = null;
+    this.ctx.storage.transactionSync(() => {
+      const current = this.inboxById(inboxId);
+      if (
+        !current ||
+        current.type !== "task" ||
+        !current.task_id ||
+        (current.state !== "QUEUED" &&
+          current.state !== "DELIVERED" &&
+          current.state !== "ACKNOWLEDGED")
+      ) {
+        this.deletePendingWorkAck(inboxId);
+        return;
+      }
+      this.ensureMeta(bound.orgId, bound.employeeId);
+      const changed = current.state !== "ACKNOWLEDGED";
+      if (changed) {
+        this.ctx.storage.sql.exec(
+          `UPDATE inbox SET state = 'ACKNOWLEDGED', acknowledged_at = ? WHERE id = ?`,
+          new Date().toISOString(),
+          inboxId,
+        );
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE meta SET current_task_id = ?, availability = 'BUSY'`,
+        current.task_id,
+      );
+      this.deleteAcceptedTaskMarker(current.task_id, current.room_id);
+      this.deletePendingWorkAck(inboxId);
+      result = { row: { ...current, state: "ACKNOWLEDGED" }, changed };
+    });
+    return result;
+  }
+
+  private deletePendingWorkAck(inboxId: string): void {
+    this.ctx.storage.sql.exec(`DELETE FROM work_ack_retries WHERE inbox_id = ?`, inboxId);
+  }
+
+  private acceptedTaskMarker(taskId: string, roomId: string | null): AcceptedTaskMarker | null {
+    return (
+      this.ctx.storage.sql
+        .exec<AcceptedTaskMarker>(
+          `SELECT task_id, room_id FROM accepted_tasks WHERE task_id = ? AND room_id IS ?`,
+          taskId,
+          roomId,
+        )
+        .toArray()[0] ?? null
+    );
+  }
+
+  private deleteAcceptedTaskMarker(taskId: string, roomId: string | null): void {
+    this.ctx.storage.sql.exec(
+      `DELETE FROM accepted_tasks WHERE task_id = ? AND room_id IS ?`,
+      taskId,
+      roomId,
+    );
+  }
+
+  private scheduleWorkAckRetry(inboxId: string): void {
+    const row = this.ctx.storage.sql
+      .exec<{ attempts: number }>(
+        `SELECT attempts FROM work_ack_retries WHERE inbox_id = ?`,
+        inboxId,
+      )
+      .toArray()[0];
+    if (!row) {
+      return;
+    }
+    const attempts = row.attempts + 1;
+    const delay = Math.min(
+      WORK_ACK_RETRY_MAX_MS,
+      WORK_ACK_RETRY_BASE_MS * 2 ** Math.min(attempts, 6),
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE work_ack_retries SET attempts = ?, next_attempt_at = ? WHERE inbox_id = ?`,
+      attempts,
+      new Date(Date.now() + delay).toISOString(),
+      inboxId,
+    );
+  }
+
+  private async retryPendingWorkAcks(): Promise<void> {
+    const pending = this.ctx.storage.sql
+      .exec<PendingWorkAck>(
+        `SELECT inbox_id, task_id, room_id, idempotency_key, canonical_acknowledged, attempts
+         FROM work_ack_retries ORDER BY next_attempt_at, inbox_id LIMIT 50`,
+      )
+      .toArray();
+    for (const ack of pending) {
+      const inbox = this.inboxById(ack.inbox_id);
+      if (
+        !inbox ||
+        inbox.type !== "task" ||
+        inbox.task_id !== ack.task_id ||
+        inbox.room_id !== ack.room_id ||
+        (inbox.state !== "QUEUED" && inbox.state !== "DELIVERED" && inbox.state !== "ACKNOWLEDGED")
+      ) {
+        this.deletePendingWorkAck(ack.inbox_id);
+        continue;
+      }
+      try {
+        if (ack.canonical_acknowledged === 0) {
+          const result = await this.executeCanonicalAck(inbox);
+          if (result.decision !== "ALLOW" || result.state !== "ACKNOWLEDGED") {
+            this.deletePendingWorkAck(ack.inbox_id);
+            continue;
+          }
+          this.markCanonicalAck(ack.inbox_id);
+        }
+        const projected = this.applyWorkAckProjection(ack.inbox_id);
+        if (projected?.changed) {
+          this.broadcast(agentEnvelope("inbox.acknowledged", inboxData(projected.row)));
+        }
+      } catch {
+        this.scheduleWorkAckRetry(ack.inbox_id);
+      }
+    }
+  }
+
+  private async refreshAlarm(): Promise<void> {
+    const socketDeadlines = this.ctx
+      .getWebSockets()
+      .map(readSocketAttachment)
+      .filter(
+        (attachment): attachment is SocketAttachment => !!attachment && !attachment.authenticated,
+      )
+      .map((attachment) => attachment.authDeadlineAt);
+    const pending = this.ctx.storage.sql
+      .exec<{ next_attempt_at: string | null }>(
+        `SELECT MIN(next_attempt_at) AS next_attempt_at FROM work_ack_retries`,
+      )
+      .toArray()[0]?.next_attempt_at;
+    const pendingAt = pending ? Date.parse(pending) : Number.NaN;
+    const deadlines = [...socketDeadlines, ...(Number.isFinite(pendingAt) ? [pendingAt] : [])];
+    if (deadlines.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(Math.min(...deadlines));
+  }
+
+  private testMode(): boolean {
+    return "TEST_MIGRATIONS" in this.env && this.env.TEST_MIGRATIONS !== undefined;
+  }
+
+  private consumeProjectionFault(): boolean {
+    if (!this.testMode()) {
+      return false;
+    }
+    let fail = false;
+    this.ctx.storage.transactionSync(() => {
+      const row = this.ctx.storage.sql
+        .exec<{ remaining: number }>(`SELECT remaining FROM projection_fault WHERE id = 1`)
+        .toArray()[0];
+      if (row && row.remaining > 0) {
+        fail = true;
+        this.ctx.storage.sql.exec(
+          `UPDATE projection_fault SET remaining = remaining - 1 WHERE id = 1`,
+        );
+      }
+    });
+    return fail;
   }
 
   private catchUp(ws: WebSocket, now: string): void {
@@ -847,6 +1367,24 @@ export class AgentDO extends DurableObject<AgentEnv> {
       `CREATE UNIQUE INDEX IF NOT EXISTS inbox_key
         ON inbox (idempotency_key)
         WHERE idempotency_key IS NOT NULL`,
+      `CREATE TABLE IF NOT EXISTS work_ack_retries (
+        inbox_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        room_id TEXT,
+        idempotency_key TEXT NOT NULL,
+        canonical_acknowledged INTEGER NOT NULL CHECK (canonical_acknowledged IN (0, 1)),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS accepted_tasks (
+        task_id TEXT PRIMARY KEY,
+        room_id TEXT,
+        accepted_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS projection_fault (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        remaining INTEGER NOT NULL CHECK (remaining >= 0)
+      )`,
     ];
     for (const statement of statements) {
       this.ctx.storage.sql.exec(statement);
@@ -956,7 +1494,9 @@ export class AgentDO extends DurableObject<AgentEnv> {
   }
 
   private openSockets(): WebSocket[] {
-    return this.ctx.getWebSockets().filter((socket) => socket.readyState === WebSocket.OPEN);
+    return this.ctx
+      .getWebSockets()
+      .filter((socket) => socket.readyState === WebSocket.OPEN && !!readAttachment(socket));
   }
 
   private closeSockets(reason: string): void {
@@ -969,7 +1509,9 @@ export class AgentDO extends DurableObject<AgentEnv> {
   private broadcast(event: AgentEnvelope): void {
     const text = JSON.stringify(event);
     for (const socket of this.openSockets()) {
-      socket.send(text);
+      if (readAttachment(socket)) {
+        socket.send(text);
+      }
     }
   }
 
@@ -1068,14 +1610,39 @@ function packetRoom(value: string): string | null | undefined {
   return value;
 }
 
-function readAttachment(ws: WebSocket): SocketAttachment | null {
+function readSocketAttachment(ws: WebSocket): SocketAttachment | null {
   const value: unknown = ws.deserializeAttachment();
   if (!value || typeof value !== "object") {
     return null;
   }
-  const sessionId = (value as { sessionId?: unknown }).sessionId;
-  if (typeof sessionId !== "string" || !isId(sessionId, "ses")) {
+  const record = value as Partial<SocketAttachment>;
+  if (
+    typeof record.authenticated !== "boolean" ||
+    typeof record.authDeadlineAt !== "number" ||
+    !Number.isFinite(record.authDeadlineAt)
+  ) {
     return null;
   }
-  return { sessionId };
+  return {
+    authenticated: record.authenticated,
+    authDeadlineAt: record.authDeadlineAt,
+    ...(typeof record.sessionId === "string" ? { sessionId: record.sessionId } : {}),
+  };
+}
+
+function readAttachment(ws: WebSocket): AuthenticatedSocketAttachment | null {
+  const attachment = readSocketAttachment(ws);
+  if (
+    !attachment ||
+    !attachment.authenticated ||
+    typeof attachment.sessionId !== "string" ||
+    !isId(attachment.sessionId, "ses")
+  ) {
+    return null;
+  }
+  return {
+    authenticated: true,
+    authDeadlineAt: attachment.authDeadlineAt,
+    sessionId: attachment.sessionId,
+  };
 }

@@ -199,7 +199,8 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
 
   async revokeHumanSession(command: ActorCommand & { sessionId: string }) {
     const gate = await this.gate(command, "runtime.bind");
-    if (gate.decision === "DENY" || command.actorType !== "human") return gate;
+    if (gate.decision === "DENY") return gate;
+    if (command.actorType !== "human") return deny("NO_PERMISSION", gate.policy_version);
     await this.env.DB.prepare(
       `UPDATE human_sessions SET revoked_at = ? WHERE org_id = ? AND id = ? AND user_id = ?`,
     )

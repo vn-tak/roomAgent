@@ -1,8 +1,8 @@
 import { sha256Hex } from "@ai-company/domain";
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { resolveHttpPrincipal } from "../src/http-principal";
-import { createStudio, organizationStub } from "./helpers";
+import { artifactStub, createStudio, hire, organizationStub } from "./helpers";
 
 describe("human session authority boundary", () => {
   it("resolves only the authenticated human, hashes secrets, and revokes sessions", async () => {
@@ -35,6 +35,64 @@ describe("human session authority boundary", () => {
     expect(await stub.verifyHumanSession({ orgId: org.id, token })).toMatchObject({
       decision: "DENY",
     });
+  });
+
+  it("authenticates HTTP human approvals instead of trusting actor identity headers", async () => {
+    const { org, store } = await createStudio("Human HTTP");
+    const worker = await hire(store, org.id, "Worker");
+    const role = await store.getRoleByCode(org.id, "employee");
+    const owner = { orgId: org.id, actorType: "human" as const, actorId: org.createdByUserId };
+    await organizationStub(org.id).assignRole({
+      ...owner,
+      employeeId: worker.id,
+      roleId: role?.id ?? "",
+    });
+    const room = await store.createRoom(org.id, { name: "Human approval", departmentId: null });
+    await store.addRoomMember(org.id, room.id, worker.id);
+    const artifact = await artifactStub(org.id).put({
+      orgId: org.id,
+      actorType: "employee",
+      actorId: worker.id,
+      idempotencyKey: "human_http_artifact",
+      roomId: room.id,
+      taskId: null,
+      artifactId: null,
+      mediaType: "text/plain",
+      filename: null,
+      checksum: null,
+      bodyBase64: btoa("Review me"),
+    });
+    expect(artifact.decision).toBe("ALLOW");
+    const url = `https://company.local/orgs/${org.id}/artifacts/${artifact.artifactId}/approvals`;
+    const forgedHeaders = {
+      "content-type": "application/json",
+      "x-idempotency-key": "human_http_approval",
+      "x-actor-type": "human",
+      "x-actor-id": org.createdByUserId,
+    };
+    const forged = await exports.default.fetch(url, {
+      method: "POST",
+      headers: forgedHeaders,
+      body: JSON.stringify({ version: 1 }),
+    });
+    expect(forged.status).toBe(401);
+    const issued = await organizationStub(org.id).issueHumanSession({ ...owner, ttlSeconds: 600 });
+    const authenticated = await exports.default.fetch(url, {
+      method: "POST",
+      headers: {
+        ...forgedHeaders,
+        authorization: `Bearer ${issued.token}`,
+        "x-actor-id": "usr_" + "0".repeat(32),
+      },
+      body: JSON.stringify({ version: 1 }),
+    });
+    expect(authenticated.status).toBe(201);
+    const approval = await env.DB.prepare(
+      "SELECT actor_id FROM approvals WHERE org_id = ? AND artifact_id = ? AND kind = 'final'",
+    )
+      .bind(org.id, artifact.artifactId)
+      .first<{ actor_id: string }>();
+    expect(approval?.actor_id).toBe(org.createdByUserId);
   });
 
   it("rejects identity headers without a token and expired sessions", async () => {
