@@ -341,7 +341,7 @@ function directUploadMetadata(c: ArtifactContext):
   const filename = c.req.header("x-filename") ?? null;
   const taskId = c.req.header("x-task-id") ?? null;
   const checksum = c.req.header("x-checksum-sha256")?.toLowerCase() ?? "";
-  const declared = c.req.header("content-length") ?? "";
+  const declared = c.req.header("x-artifact-size") ?? "";
   const size = /^\d+$/.test(declared) ? Number(declared) : 0;
   const error = (code: string, message: string, status: number) => ({
     ok: false as const,

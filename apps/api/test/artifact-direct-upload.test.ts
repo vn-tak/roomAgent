@@ -33,7 +33,7 @@ function uploadHeaders(
   return {
     authorization: `Bearer ${session.token}`,
     "content-type": "video/mp4",
-    "content-length": String(value.byteLength),
+    "x-artifact-size": String(value.byteLength),
     "x-checksum-sha256": sha256,
     "x-employee-id": employeeId,
     "x-idempotency-key": key,

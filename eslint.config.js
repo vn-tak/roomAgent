@@ -5,6 +5,7 @@ export default tseslint.config(
   {
     ignores: [
       "**/node_modules/**",
+      ".hoplite/**",
       "**/.wrangler/**",
       "**/dist/**",
       "**/worker-configuration.d.ts",
