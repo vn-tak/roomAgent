@@ -1,4 +1,3 @@
-import type { AgentDO } from "@ai-company/agent";
 import { parseDomainEvent, type DomainEvent } from "@ai-company/domain";
 import {
   AGENT_DELIVERY_QUEUE,
@@ -9,14 +8,17 @@ import {
   FAULT_D1,
 } from "./names";
 import { bumpEventCounter, takeEventFault } from "./test-seam";
+import {
+  ARTIFACT_VERSION_EVENT,
+  HUMAN_APPROVAL_EVENT,
+  QA_EVIDENCE_EVENT,
+  SECURITY_EVIDENCE_EVENT,
+  notifyProductionTaskEvidence,
+} from "../production-task-workflow";
 
 const DELIVERY_TIMEOUT_MS = 5_000;
 
-interface EventBindings {
-  DB: D1Database;
-  AGENT: DurableObjectNamespace<AgentDO>;
-  AGENT_DELIVERY: Queue;
-}
+type EventBindings = Env;
 
 export async function handleQueue(batch: MessageBatch<unknown>, env: EventBindings): Promise<void> {
   for (const message of batch.messages) {
@@ -65,7 +67,19 @@ async function consumeDomain(message: Message<unknown>, env: EventBindings): Pro
   const at = new Date().toISOString();
   await insertDomain(env, event, at);
   await insertAudit(env, event, at);
-  if (event.type === "task.delivered") {
+  if (event.type === "artifact.version.created") {
+    await notifyProductionTaskEvidence(env, event.org_id, event.subject_id, ARTIFACT_VERSION_EVENT);
+  } else if (event.type === "review.recorded") {
+    await notifyProductionTaskEvidence(env, event.org_id, event.subject_id, QA_EVIDENCE_EVENT);
+  } else if (event.type === "approval.granted" || event.type === "approval.denied") {
+    await notifyProductionTaskEvidence(
+      env,
+      event.org_id,
+      event.subject_id,
+      event.payload.kind === "security" ? SECURITY_EVIDENCE_EVENT : HUMAN_APPROVAL_EVENT,
+    );
+  }
+  if (event.type === "task.delivered" || event.type === "task.acknowledged") {
     await env.AGENT_DELIVERY.send(event);
   }
 }
@@ -76,17 +90,53 @@ async function consumeDelivery(message: Message<unknown>, env: EventBindings): P
     throw new EventDeliveryError("AGENT_DELIVERY_TIMEOUT");
   }
   const event = parseDomainEvent(message.body);
-  if (!event || event.type !== "task.delivered" || !event.payload.assignee_id) {
+  if (
+    !event ||
+    (event.type !== "task.delivered" && event.type !== "task.acknowledged") ||
+    !event.payload.assignee_id
+  ) {
     throw new EventDeliveryError("INVALID_EVENT");
   }
   const task = await env.DB.prepare(
-    `SELECT id, objective, creator_id, room_id
+    `SELECT id, objective, creator_id, room_id, state, assignee_id
      FROM tasks WHERE org_id = ? AND id = ?`,
   )
     .bind(event.org_id, event.subject_id)
-    .first<{ id: string; objective: string; creator_id: string; room_id: string | null }>();
+    .first<{
+      id: string;
+      objective: string;
+      creator_id: string;
+      room_id: string | null;
+      state: string;
+      assignee_id: string | null;
+    }>();
   if (!task) {
     throw new EventDeliveryError("DELIVERY_UNAVAILABLE");
+  }
+  if (event.type === "task.acknowledged") {
+    if (task.assignee_id !== event.payload.assignee_id || task.room_id !== event.room_id) {
+      return; // A later assignment supersedes this projection.
+    }
+    if (
+      !["ACKNOWLEDGED", "WORKING", "REVIEW", "REVISION", "APPROVED", "COMPLETED"].includes(
+        task.state,
+      )
+    ) {
+      return;
+    }
+    const projected = await withTimeout(
+      env.AGENT.getByName(
+        `agent:${event.org_id}:${event.payload.assignee_id}`,
+      ).applyCanonicalTaskAck({
+        orgId: event.org_id,
+        employeeId: event.payload.assignee_id,
+        taskId: task.id,
+        idempotencyKey: event.idempotency_key,
+      }),
+      DELIVERY_TIMEOUT_MS,
+    );
+    if (projected.decision === "DENY") throw new EventDeliveryError("DELIVERY_UNAVAILABLE");
+    return;
   }
   const body = JSON.stringify({
     task_id: task.id,
