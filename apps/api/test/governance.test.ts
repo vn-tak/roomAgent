@@ -282,6 +282,21 @@ describe("governance records", () => {
         `SELECT COUNT(*) AS n FROM domain_events WHERE org_id = ? AND type = 'review.recorded'`,
       ),
     ).toBe(0);
+    expect(await artifactStub(studio.org.id).outboxStateForTest()).toContainEqual(
+      expect.objectContaining({
+        status: "pending",
+        attempts: 1,
+        failureReason: "QUEUE_SEND_FAILED",
+      }),
+    );
+    await until(async () => {
+      expect(
+        await count(
+          studio.org.id,
+          `SELECT COUNT(*) AS n FROM domain_events WHERE org_id = ? AND type = 'review.recorded'`,
+        ),
+      ).toBe(1);
+    });
     const failedAgain = await review({
       ...qaActor,
       idempotencyKey: "review_fail_001",
@@ -299,14 +314,12 @@ describe("governance records", () => {
         result: "PASS",
       }),
     ).toMatchObject({ decision: "DENY", reason: "IDEMPOTENCY_MISMATCH" });
-    await until(async () => {
-      expect(
-        await count(
-          studio.org.id,
-          `SELECT COUNT(*) AS n FROM domain_events WHERE org_id = ? AND type = 'review.recorded'`,
-        ),
-      ).toBe(1);
-    });
+    expect(
+      await count(
+        studio.org.id,
+        `SELECT COUNT(*) AS n FROM domain_events WHERE org_id = ? AND type = 'review.recorded'`,
+      ),
+    ).toBe(1);
     expect(
       await review({
         ...qaActor,

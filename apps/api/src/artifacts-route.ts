@@ -1,4 +1,10 @@
-import type { ArtifactReadResult, ArtifactResult } from "@ai-company/artifact";
+import type {
+  ArtifactReadResult,
+  ArtifactResult,
+  ArtifactUploadReserve,
+  ArtifactUploadResult,
+} from "@ai-company/artifact";
+import { MAX_DIRECT_ARTIFACT_BYTES } from "@ai-company/artifact";
 import {
   MAX_ARTIFACT_BYTES,
   canonicalMediaType,
@@ -6,6 +12,7 @@ import {
   isId,
 } from "@ai-company/domain";
 import type { Context, Hono } from "hono";
+import { resolveHttpPrincipal } from "./http-principal";
 
 type EnvVars = { Bindings: Env; Variables: { requestId: string } };
 type App = Hono<EnvVars>;
@@ -31,8 +38,8 @@ export function registerArtifactRoutes(app: App): void {
     }
     const result = await c.env.ARTIFACT.getByName(`artifacts:${orgId}`).put({
       orgId,
-      actorType: "employee",
-      actorId: session.employeeId,
+      actorType: session.actorType,
+      actorId: session.actorId,
       idempotencyKey: uploaded.idempotencyKey,
       roomId,
       artifactId: null,
@@ -62,8 +69,8 @@ export function registerArtifactRoutes(app: App): void {
     }
     const result = await c.env.ARTIFACT.getByName(`artifacts:${orgId}`).put({
       orgId,
-      actorType: "employee",
-      actorId: session.employeeId,
+      actorType: session.actorType,
+      actorId: session.actorId,
       idempotencyKey: uploaded.idempotencyKey,
       roomId: null,
       artifactId,
@@ -93,12 +100,74 @@ export function registerArtifactRoutes(app: App): void {
     }
     const result = await c.env.ARTIFACT.getByName(`artifacts:${orgId}`).read({
       orgId,
-      actorType: "employee",
-      actorId: session.employeeId,
+      actorType: session.actorType,
+      actorId: session.actorId,
       artifactId,
       version,
+      metadataOnly: true,
     });
     return readResponse(c, requestId, result);
+  });
+
+  app.post("/orgs/:orgId/rooms/:roomId/artifacts/uploads", async (c) => {
+    const orgId = c.req.param("orgId");
+    const roomId = c.req.param("roomId");
+    if (!isId(orgId, "org") || !isId(roomId, "room")) {
+      return c.json(errorBody(c.get("requestId"), "NOT_FOUND", "Artifact was not found."), 404);
+    }
+    const session = await openSession(c, orgId, "artifact.create");
+    if (!session.ok) {
+      return session.response;
+    }
+    return reserveDirectUpload(c, {
+      orgId,
+      actorType: session.actorType,
+      actorId: session.actorId,
+      roomId,
+      artifactId: null,
+    });
+  });
+
+  app.post("/orgs/:orgId/artifacts/:artifactId/uploads", async (c) => {
+    const orgId = c.req.param("orgId");
+    const artifactId = c.req.param("artifactId");
+    if (!isId(orgId, "org") || !isId(artifactId, "art")) {
+      return c.json(errorBody(c.get("requestId"), "NOT_FOUND", "Artifact was not found."), 404);
+    }
+    const session = await openSession(c, orgId, "artifact.modify");
+    if (!session.ok) {
+      return session.response;
+    }
+    return reserveDirectUpload(c, {
+      orgId,
+      actorType: session.actorType,
+      actorId: session.actorId,
+      roomId: null,
+      artifactId,
+    });
+  });
+
+  app.put("/orgs/:orgId/artifacts/uploads/:uploadToken", async (c) => {
+    return streamReservedUpload(c);
+  });
+
+  app.post("/orgs/:orgId/artifacts/uploads/:uploadToken/commit", async (c) => {
+    const requestId = c.get("requestId");
+    const orgId = c.req.param("orgId");
+    if (!isId(orgId, "org")) {
+      return c.json(errorBody(requestId, "NOT_FOUND", "Artifact was not found."), 404);
+    }
+    const session = await openUploadSession(c, orgId);
+    if (!session.ok) {
+      return session.response;
+    }
+    const result = await c.env.ARTIFACT.getByName(`artifacts:${orgId}`).commitUpload({
+      orgId,
+      actorType: session.actorType,
+      actorId: session.actorId,
+      uploadToken: c.req.param("uploadToken"),
+    });
+    return putResponse(c, requestId, result);
   });
 }
 
@@ -106,33 +175,200 @@ async function openSession(
   c: ArtifactContext,
   orgId: string,
   scope: string,
-): Promise<{ ok: true; employeeId: string } | { ok: false; response: Response }> {
+): Promise<
+  { ok: true; actorType: "human" | "employee"; actorId: string } | { ok: false; response: Response }
+> {
   const requestId = c.get("requestId");
-  const header = c.req.header("authorization");
-  const employeeId = c.req.header("x-employee-id");
-  const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-  if (!employeeId || !isId(employeeId, "emp") || !/^[0-9a-f]{64}$/.test(token)) {
-    return {
-      ok: false,
-      response: c.json(errorBody(requestId, "SESSION_INVALID", "Session is not valid."), 401),
-    };
-  }
-  const verified = await c.env.AGENT.getByName(`agent:${orgId}:${employeeId}`).verify({
+  const principal = await resolveHttpPrincipal(
+    c.env,
     orgId,
-    employeeId,
-    token,
+    c.req.header("authorization"),
+    c.req.header("x-employee-id"),
     scope,
-  });
-  if (verified.decision === "DENY") {
+  );
+  if (principal.decision === "DENY" || !principal.actorType || !principal.actorId) {
     return {
       ok: false,
       response: c.json(
-        errorBody(requestId, verified.reason, "Session is not valid."),
-        sessionStatus(verified.reason),
+        errorBody(requestId, principal.reason, "Session is not valid."),
+        sessionStatus(principal.reason),
       ),
     };
   }
-  return { ok: true, employeeId };
+  return {
+    ok: true,
+    actorType: principal.actorType,
+    actorId: principal.actorId,
+  };
+}
+
+async function openUploadSession(
+  c: ArtifactContext,
+  orgId: string,
+): Promise<
+  { ok: true; actorType: "human" | "employee"; actorId: string } | { ok: false; response: Response }
+> {
+  const createSession = await openSession(c, orgId, "artifact.create");
+  if (createSession.ok || createSession.response.status !== 403) {
+    return createSession;
+  }
+  return openSession(c, orgId, "artifact.modify");
+}
+
+async function reserveDirectUpload(
+  c: ArtifactContext,
+  actor: Pick<ArtifactUploadReserve, "orgId" | "actorType" | "actorId" | "roomId" | "artifactId">,
+): Promise<Response> {
+  const requestId = c.get("requestId");
+  const parsed = directUploadMetadata(c);
+  if (!parsed.ok) {
+    return parsed.response;
+  }
+  const command: ArtifactUploadReserve = {
+    ...actor,
+    ...parsed.value,
+  };
+  const reserved = await c.env.ARTIFACT.getByName(`artifacts:${actor.orgId}`).reserveUpload(
+    command,
+  );
+  return uploadReservationResponse(c, requestId, reserved);
+}
+
+async function streamReservedUpload(c: ArtifactContext): Promise<Response> {
+  const requestId = c.get("requestId");
+  const orgId = c.req.param("orgId");
+  if (!isId(orgId, "org")) {
+    return c.json(errorBody(requestId, "NOT_FOUND", "Artifact was not found."), 404);
+  }
+  const session = await openUploadSession(c, orgId);
+  if (!session.ok) {
+    return session.response;
+  }
+  const uploadToken = c.req.param("uploadToken");
+  const target = await c.env.ARTIFACT.getByName(`artifacts:${orgId}`).uploadTarget({
+    orgId,
+    actorType: session.actorType,
+    actorId: session.actorId,
+    uploadToken,
+  });
+  if (target.decision === "DENY" || !target.r2Key || !target.sha256 || !target.mediaType) {
+    const reason = target.decision === "DENY" ? target.reason : "UPLOAD_CAPABILITY_INVALID";
+    return c.json(errorBody(requestId, reason, messageFor(reason)), statusFor(reason));
+  }
+  const declared = c.req.header("content-length") ?? "";
+  const size = /^\d+$/.test(declared) ? Number(declared) : 0;
+  if (size !== target.size || size < 1) {
+    return c.json(errorBody(requestId, "INVALID_INPUT", "Content length does not match."), 400);
+  }
+  const checksum = fromHex(target.sha256);
+  const body = c.req.raw.body;
+  if (!checksum || !body) {
+    return c.json(errorBody(requestId, "INVALID_INPUT", "Artifact body is empty."), 400);
+  }
+  try {
+    const created = await c.env.ARTIFACTS.put(target.r2Key, body, {
+      onlyIf: { etagDoesNotMatch: "*" },
+      sha256: checksum,
+      httpMetadata: { contentType: target.mediaType },
+      customMetadata: { sha256: target.sha256 },
+    });
+    if (!created) {
+      return c.json(errorBody(requestId, "ARTIFACT_EXISTS", messageFor("ARTIFACT_EXISTS")), 409);
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.toLowerCase() : "";
+    const reason =
+      detail.includes("checksum") || detail.includes("digest")
+        ? "CHECKSUM_MISMATCH"
+        : "UPLOAD_UNAVAILABLE";
+    return c.json(errorBody(requestId, reason, messageFor(reason)), statusFor(reason));
+  }
+  return c.json({ uploaded: true }, 201);
+}
+
+function uploadReservationResponse(
+  c: ArtifactContext,
+  requestId: string,
+  result: ArtifactUploadResult,
+): Response {
+  if (result.decision === "DENY") {
+    const reason = publicArtifactReason(result.reason);
+    return c.json(errorBody(requestId, reason, messageFor(reason)), statusFor(reason));
+  }
+  const uploadUrl = result.uploadToken
+    ? new URL(
+        `/orgs/${encodeURIComponent(c.req.param("orgId"))}/artifacts/uploads/${result.uploadToken}`,
+        c.req.url,
+      ).toString()
+    : null;
+  return c.json(
+    {
+      artifact_id: result.artifactId,
+      version: result.version,
+      sha256: result.sha256,
+      upload_url: uploadUrl,
+      commit_url: result.uploadToken ? `${uploadUrl}/commit` : null,
+      expires_at: result.expiresAt ? new Date(result.expiresAt).toISOString() : null,
+      duplicate: result.duplicate,
+    },
+    result.duplicate ? 200 : 201,
+  );
+}
+
+function fromHex(value: string): Uint8Array | null {
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    return null;
+  }
+  const bytes = new Uint8Array(32);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function directUploadMetadata(c: ArtifactContext):
+  | {
+      ok: true;
+      value: Pick<
+        ArtifactUploadReserve,
+        "idempotencyKey" | "taskId" | "mediaType" | "filename" | "checksum" | "size"
+      >;
+    }
+  | { ok: false; response: Response } {
+  const requestId = c.get("requestId");
+  const idempotencyKey = c.req.header("x-idempotency-key") ?? "";
+  const mediaType = canonicalMediaType(c.req.header("content-type") ?? "");
+  const filename = c.req.header("x-filename") ?? null;
+  const taskId = c.req.header("x-task-id") ?? null;
+  const checksum = c.req.header("x-checksum-sha256")?.toLowerCase() ?? "";
+  const declared = c.req.header("content-length") ?? "";
+  const size = /^\d+$/.test(declared) ? Number(declared) : 0;
+  const error = (code: string, message: string, status: number) => ({
+    ok: false as const,
+    response: c.json(errorBody(requestId, code, message), status as 400 | 413),
+  });
+  if (!KEY.test(idempotencyKey)) {
+    return error("INVALID_INPUT", "Idempotency key is not valid.", 400);
+  }
+  if (!mediaType) {
+    return error("INVALID_INPUT", "Media type is not allowed.", 400);
+  }
+  if (filename !== null && !isArtifactFilename(filename)) {
+    return error("INVALID_INPUT", "Filename is not valid.", 400);
+  }
+  if (taskId !== null && !isId(taskId, "task")) {
+    return error("INVALID_INPUT", "Task is not valid.", 400);
+  }
+  if (!/^[0-9a-f]{64}$/.test(checksum) || size < 1) {
+    return error("INVALID_INPUT", "Upload checksum and content length are required.", 400);
+  }
+  if (size > MAX_DIRECT_ARTIFACT_BYTES) {
+    return error("PAYLOAD_TOO_LARGE", "Artifact exceeds the direct upload limit.", 413);
+  }
+  return {
+    ok: true,
+    value: { idempotencyKey, taskId, mediaType, filename, checksum, size },
+  };
 }
 
 async function readUpload(c: ArtifactContext): Promise<
@@ -244,10 +480,8 @@ function readVersion(value: string | undefined): number | null | "invalid" {
 
 function putResponse(c: ArtifactContext, requestId: string, result: ArtifactResult): Response {
   if (result.decision === "DENY") {
-    return c.json(
-      errorBody(requestId, result.reason, messageFor(result.reason)),
-      statusFor(result.reason),
-    );
+    const reason = publicArtifactReason(result.reason);
+    return c.json(errorBody(requestId, reason, messageFor(reason)), statusFor(reason));
   }
   return c.json(
     {
@@ -262,23 +496,46 @@ function putResponse(c: ArtifactContext, requestId: string, result: ArtifactResu
   );
 }
 
-function readResponse(c: ArtifactContext, requestId: string, result: ArtifactReadResult): Response {
-  if (result.decision === "DENY" || !result.bodyBase64 || !result.mediaType || !result.sha256) {
+function publicArtifactReason(reason: string): string {
+  return reason === "ROOM_MISMATCH" ? "TENANT_BOUNDARY" : reason;
+}
+
+async function readResponse(
+  c: ArtifactContext,
+  requestId: string,
+  result: ArtifactReadResult,
+): Promise<Response> {
+  if (
+    result.decision === "DENY" ||
+    !result.r2Key ||
+    !result.mediaType ||
+    !result.sha256 ||
+    result.size === null
+  ) {
     const reason = result.decision === "DENY" ? result.reason : "INTEGRITY";
     return c.json(errorBody(requestId, reason, messageFor(reason)), statusFor(reason));
   }
-  const bytes = decodeBase64(result.bodyBase64);
-  if (!bytes) {
+  const object = await c.env.ARTIFACTS.get(result.r2Key);
+  if (!object || object.size !== result.size) {
+    return c.json(errorBody(requestId, "INTEGRITY", messageFor("INTEGRITY")), 409);
+  }
+  const checksum = object.checksums.sha256;
+  if (checksum && toHex(new Uint8Array(checksum)) !== result.sha256) {
     return c.json(errorBody(requestId, "INTEGRITY", messageFor("INTEGRITY")), 409);
   }
   c.header("content-type", result.mediaType);
   c.header("x-artifact-id", result.artifactId ?? "");
   c.header("x-artifact-version", String(result.version ?? ""));
   c.header("x-checksum-sha256", result.sha256);
-  const buffer = new ArrayBuffer(bytes.byteLength);
-  const view = new Uint8Array(buffer);
-  view.set(bytes);
-  return c.body(view);
+  return c.body(object.body);
+}
+
+function toHex(bytes: Uint8Array): string {
+  let value = "";
+  for (const byte of bytes) {
+    value += byte.toString(16).padStart(2, "0");
+  }
+  return value;
 }
 
 function sessionStatus(reason: string): 401 | 403 | 404 {
@@ -291,19 +548,24 @@ function sessionStatus(reason: string): 401 | 403 | 404 {
   return 401;
 }
 
-function statusFor(reason: string): 400 | 403 | 404 | 409 | 413 {
+function statusFor(reason: string): 400 | 403 | 404 | 409 | 413 | 503 {
   switch (reason) {
     case "INVALID_INPUT":
     case "CHECKSUM_MISMATCH":
       return 400;
     case "TENANT_BOUNDARY":
+    case "ROOM_MISMATCH":
       return 404;
     case "ARTIFACT_EXISTS":
     case "INTEGRITY":
     case "IDEMPOTENCY_MISMATCH":
+    case "UPLOAD_CAPABILITY_INVALID":
+    case "UPLOAD_MISSING":
       return 409;
     case "PAYLOAD_TOO_LARGE":
       return 413;
+    case "UPLOAD_UNAVAILABLE":
+      return 503;
     default:
       return 403;
   }
@@ -327,6 +589,13 @@ function messageFor(reason: string): string {
       return "Idempotency key was already used.";
     case "TENANT_BOUNDARY":
       return "Artifact was not found.";
+    case "ROOM_MISMATCH":
+    case "UPLOAD_CAPABILITY_INVALID":
+      return "Artifact was not found.";
+    case "UPLOAD_MISSING":
+      return "Reserved artifact upload is not present.";
+    case "UPLOAD_UNAVAILABLE":
+      return "Artifact upload is temporarily unavailable.";
     default:
       return "Artifact request was rejected.";
   }
@@ -358,21 +627,4 @@ function encodeBase64(bytes: Uint8Array): string {
     binary += part;
   }
   return encode(binary);
-}
-
-function decodeBase64(value: string): Uint8Array | null {
-  const decode = (globalThis as { atob?: (value: string) => string }).atob;
-  if (!decode) {
-    return null;
-  }
-  try {
-    const binary = decode(value);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) {
-      bytes[index] = binary.charCodeAt(index);
-    }
-    return bytes;
-  } catch {
-    return null;
-  }
 }

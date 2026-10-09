@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   MAX_ARTIFACT_BASE64,
   MAX_ARTIFACT_BYTES,
+  MAX_DIRECT_ARTIFACT_BYTES,
   artifactObjectKey,
   buildArtifactEvent,
   buildGovernanceEvent,
@@ -41,6 +42,42 @@ export interface ArtifactPut {
   bodyBase64: string;
 }
 
+export interface ArtifactUploadReserve extends Omit<ArtifactPut, "bodyBase64"> {
+  size: number;
+}
+
+export interface ArtifactUploadResult {
+  decision: "ALLOW" | "DENY";
+  reason: string;
+  artifactId: string | null;
+  version: number | null;
+  r2Key: string | null;
+  sha256: string | null;
+  uploadToken: string | null;
+  expiresAt: number | null;
+  duplicate: boolean;
+}
+
+export interface ArtifactUploadTarget {
+  decision: "ALLOW" | "DENY";
+  reason: string;
+  r2Key: string | null;
+  sha256: string | null;
+  size: number | null;
+  mediaType: string | null;
+}
+
+export interface ArtifactUploadCommand {
+  orgId: string;
+  actorType: "human" | "employee";
+  actorId: string;
+  uploadToken: string;
+}
+
+export { MAX_DIRECT_ARTIFACT_BYTES };
+const UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000;
+const OUTBOX_RETRY_DELAYS_MS = [1_000, 5_000, 15_000, 60_000, 300_000] as const;
+
 export interface ArtifactResult {
   decision: "ALLOW" | "DENY";
   reason: string;
@@ -58,6 +95,7 @@ export interface ArtifactRead {
   actorId: string;
   artifactId: string;
   version: number | null;
+  metadataOnly?: boolean;
 }
 
 export interface ArtifactReadResult {
@@ -118,6 +156,7 @@ type ArtifactRow = {
   creator_type: string;
   creator_id: string;
   canonical_version: number;
+  correlation_id: string;
   created_at: string;
   updated_at: string;
 };
@@ -127,6 +166,7 @@ type VersionRow = {
   version: number;
   room_id: string;
   task_id: string | null;
+  correlation_id: string;
   r2_key: string;
   sha256: string;
   media_type: string;
@@ -185,6 +225,20 @@ interface ParsedPut {
   mediaType: string;
   filename: string | null;
   checksum: string | null;
+}
+
+type ArtifactCommand = Omit<ArtifactPut, "bodyBase64">;
+type OutboxTable = "event_outbox" | "governance_outbox";
+
+interface UploadCapabilityRow extends Record<string, string | number | null> {
+  token_hash: string;
+  actor_type: "human" | "employee";
+  actor_id: string;
+  idempotency_key: string;
+  artifact_id: string;
+  version: number;
+  expires_at: number;
+  status: string;
 }
 
 type Replay =
@@ -264,6 +318,49 @@ function denied(reason: string, duplicate = false): ArtifactResult {
   };
 }
 
+function deniedUpload(reason: string): ArtifactUploadResult {
+  return {
+    decision: "DENY",
+    reason,
+    artifactId: null,
+    version: null,
+    r2Key: null,
+    sha256: null,
+    uploadToken: null,
+    expiresAt: null,
+    duplicate: false,
+  };
+}
+
+function uploadReservation(
+  result: ArtifactResult,
+  uploadToken: string | null,
+  expiresAt: number | null,
+): ArtifactUploadResult {
+  return {
+    decision: result.decision,
+    reason: result.reason,
+    artifactId: result.artifactId,
+    version: result.version,
+    r2Key: result.r2Key,
+    sha256: result.sha256,
+    uploadToken,
+    expiresAt,
+    duplicate: result.duplicate,
+  };
+}
+
+function deniedUploadTarget(reason: string): ArtifactUploadTarget {
+  return {
+    decision: "DENY",
+    reason,
+    r2Key: null,
+    sha256: null,
+    size: null,
+    mediaType: null,
+  };
+}
+
 function denyRead(
   reason: string,
   artifact: ArtifactRow | null = null,
@@ -313,6 +410,25 @@ function sameLabel(left: string | null, right: string | null): boolean {
   return (left ?? null) === (right ?? null);
 }
 
+function toHex(bytes: Uint8Array): string {
+  let value = "";
+  for (const byte of bytes) {
+    value += byte.toString(16).padStart(2, "0");
+  }
+  return value;
+}
+
+function fromHex(value: string): Uint8Array | null {
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    return null;
+  }
+  const bytes = new Uint8Array(32);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
 function actorProblem(actor: { actorType: string; actorId: string }): string | null {
   if (actor.actorType !== "human" && actor.actorType !== "employee") {
     return "INVALID_INPUT";
@@ -326,7 +442,7 @@ function actorProblem(actor: { actorType: string; actorId: string }): string | n
   return null;
 }
 
-function parsePut(command: ArtifactPut): ParsedPut | null {
+function parsePut(command: ArtifactCommand): ParsedPut | null {
   if (!KEY.test(command.idempotencyKey)) {
     return null;
   }
@@ -466,8 +582,9 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     if (!(await this.roomActive(command.orgId, roomId))) {
       return denied("TENANT_BOUNDARY");
     }
-    if (taskId && !(await this.taskInOrg(command.orgId, taskId))) {
-      return denied("TENANT_BOUNDARY");
+    const taskLink = taskId ? await this.taskInRoom(command.orgId, taskId, roomId) : null;
+    if (taskLink && taskLink.decision !== "ALLOW") {
+      return denied(taskLink.reason);
     }
     const decision = await this.authorize(
       command,
@@ -509,7 +626,15 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     const reserved =
       replay.kind === "pending"
         ? replay.version
-        : this.claim(command, roomId, taskId, parsed, sha, bytes.byteLength);
+        : this.claim(
+            command,
+            roomId,
+            taskId,
+            parsed,
+            sha,
+            bytes.byteLength,
+            existing?.correlation_id || taskLink?.correlationId || createId("corr"),
+          );
     if (!reserved) {
       const raced = this.replay(
         command,
@@ -536,6 +661,328 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
       return denied("INVALID_INPUT");
     }
     return this.finish(command, reserved, bytes, sha, parsed.mediaType);
+  }
+
+  private async issueUploadCapability(
+    command: ArtifactCommand,
+    version: VersionRow,
+  ): Promise<ArtifactUploadResult> {
+    const token = toHex(crypto.getRandomValues(new Uint8Array(32)));
+    const tokenHash = await sha256Hex(token);
+    const expiresAt = Date.now() + UPLOAD_TOKEN_TTL_MS;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO upload_capabilities (
+        token_hash, actor_type, actor_id, idempotency_key, artifact_id, version, expires_at, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      tokenHash,
+      command.actorType,
+      command.actorId,
+      command.idempotencyKey,
+      version.artifact_id,
+      version.version,
+      expiresAt,
+    );
+    return uploadReservation(allowed(version, version.version, false), token, expiresAt);
+  }
+
+  private async uploadCapability(
+    command: ArtifactUploadCommand,
+  ): Promise<UploadCapabilityRow | null> {
+    const bound = this.bound();
+    if (
+      !bound ||
+      command.orgId !== bound.orgId ||
+      actorProblem(command) !== null ||
+      !/^[0-9a-f]{64}$/.test(command.uploadToken)
+    ) {
+      return null;
+    }
+    const tokenHash = await sha256Hex(command.uploadToken);
+    const row = this.ctx.storage.sql
+      .exec<UploadCapabilityRow>(
+        `SELECT token_hash, actor_type, actor_id, idempotency_key, artifact_id, version, expires_at, status
+         FROM upload_capabilities WHERE token_hash = ?`,
+        tokenHash,
+      )
+      .toArray()[0];
+    if (!row || row.actor_type !== command.actorType || row.actor_id !== command.actorId) {
+      return null;
+    }
+    return row;
+  }
+
+  private artifactCommand(
+    cap: UploadCapabilityRow,
+    version: VersionRow | null,
+  ): ArtifactCommand | null {
+    const bound = this.bound();
+    const stored = this.commandByKey({
+      orgId: bound?.orgId ?? "",
+      actorType: cap.actor_type,
+      actorId: cap.actor_id,
+      idempotencyKey: cap.idempotency_key,
+      roomId: version?.room_id ?? null,
+      artifactId: null,
+      taskId: version?.task_id ?? null,
+      mediaType: version?.media_type ?? "",
+      filename: version?.filename ?? null,
+      checksum: version?.sha256 ?? null,
+    });
+    if (!bound || !version || !stored) {
+      return null;
+    }
+    return {
+      orgId: bound.orgId,
+      actorType: cap.actor_type,
+      actorId: cap.actor_id,
+      idempotencyKey: cap.idempotency_key,
+      roomId: version.room_id,
+      artifactId: stored.requested_artifact_id || null,
+      taskId: version.task_id,
+      mediaType: version.media_type,
+      filename: version.filename,
+      checksum: version.sha256,
+    };
+  }
+
+  private async finishReserved(command: ArtifactCommand, version: VersionRow): Promise<void> {
+    try {
+      await this.project(command.orgId, version, command.actorType, command.actorId);
+    } catch (error) {
+      if (storageText(error).includes("TENANT_MISMATCH")) {
+        this.sealDenial(command, version, "TENANT_BOUNDARY");
+        throw new Error("ARTIFACT_PROJECTION_BOUNDARY", { cause: error });
+      }
+      throw error;
+    }
+    await this.markStored(command, version);
+    await this.scheduleOutboxAlarm();
+    await this.publishStaged(command);
+  }
+
+  async reserveUpload(command: ArtifactUploadReserve): Promise<ArtifactUploadResult> {
+    const bound = this.bound();
+    if (!bound || command.orgId !== bound.orgId) {
+      return deniedUpload("TENANT_BOUNDARY");
+    }
+    const actor = actorProblem(command);
+    const parsed = parsePut(command);
+    if (
+      actor ||
+      !parsed ||
+      !parsed.checksum ||
+      !Number.isInteger(command.size) ||
+      command.size < 1 ||
+      command.size > MAX_DIRECT_ARTIFACT_BYTES
+    ) {
+      return deniedUpload(actor ?? "INVALID_INPUT");
+    }
+    const existing = parsed.artifactId ? this.artifactById(parsed.artifactId) : null;
+    if (parsed.artifactId && !existing) {
+      return deniedUpload("TENANT_BOUNDARY");
+    }
+    if (existing && parsed.roomId !== null && parsed.roomId !== existing.room_id) {
+      return deniedUpload("TENANT_BOUNDARY");
+    }
+    if (existing && parsed.taskId !== null && !sameLabel(parsed.taskId, existing.task_id)) {
+      return deniedUpload("TENANT_BOUNDARY");
+    }
+    const roomId = existing?.room_id ?? parsed.roomId;
+    const taskId = existing ? existing.task_id : parsed.taskId;
+    if (!roomId || !(await this.roomActive(command.orgId, roomId))) {
+      return deniedUpload("TENANT_BOUNDARY");
+    }
+    const taskLink = taskId ? await this.taskInRoom(command.orgId, taskId, roomId) : null;
+    if (taskLink && taskLink.decision !== "ALLOW") {
+      return deniedUpload(taskLink.reason);
+    }
+    const decision = await this.authorize(
+      command,
+      existing ? "artifact.modify" : "artifact.create",
+      existing?.id ?? command.orgId,
+      existing?.creator_id ?? null,
+    );
+    if (decision.decision === "DENY") {
+      return deniedUpload(decision.reason);
+    }
+    if (
+      command.actorType === "employee" &&
+      !(await this.activeMember(command.orgId, roomId, command.actorId))
+    ) {
+      return deniedUpload("NOT_MEMBER");
+    }
+    if (existing && !(await this.canRevise(command, existing))) {
+      return deniedUpload("NOT_CREATOR");
+    }
+    const replay = this.replay(
+      command,
+      parsed.checksum,
+      roomId,
+      taskId,
+      parsed.mediaType,
+      parsed.filename,
+      command.size,
+    );
+    if (replay.kind === "mismatch") {
+      return deniedUpload("IDEMPOTENCY_MISMATCH");
+    }
+    if (replay.kind === "deny") {
+      return deniedUpload(replay.result.reason);
+    }
+    if (replay.kind === "allow") {
+      return uploadReservation(replay.result, null, null);
+    }
+    const correlationId = existing?.correlation_id || taskLink?.correlationId || createId("corr");
+    const version =
+      replay.kind === "pending"
+        ? replay.version
+        : this.claim(command, roomId, taskId, parsed, parsed.checksum, command.size, correlationId);
+    if (!version) {
+      const raced = this.replay(
+        command,
+        parsed.checksum,
+        roomId,
+        taskId,
+        parsed.mediaType,
+        parsed.filename,
+        command.size,
+      );
+      if (raced.kind === "allow") {
+        return uploadReservation(raced.result, null, null);
+      }
+      if (raced.kind === "pending") {
+        return this.issueUploadCapability(command, raced.version);
+      }
+      return deniedUpload(raced.kind === "mismatch" ? "IDEMPOTENCY_MISMATCH" : "INVALID_INPUT");
+    }
+    return this.issueUploadCapability(command, version);
+  }
+
+  private async uploadAuthority(
+    cap: UploadCapabilityRow,
+    version: VersionRow,
+  ): Promise<string | null> {
+    const command = this.artifactCommand(cap, version);
+    if (!command || !(await this.roomActive(command.orgId, version.room_id))) {
+      return "TENANT_BOUNDARY";
+    }
+    if (version.task_id) {
+      const linked = await this.taskInRoom(command.orgId, version.task_id, version.room_id);
+      if (linked.decision === "DENY") return linked.reason;
+    }
+    const artifact = this.artifactById(version.artifact_id);
+    const decision = await this.authorize(
+      command,
+      command.artifactId ? "artifact.modify" : "artifact.create",
+      version.artifact_id,
+      artifact?.creator_id ?? null,
+    );
+    if (decision.decision === "DENY") return decision.reason;
+    if (
+      command.actorType === "employee" &&
+      !(await this.activeMember(command.orgId, version.room_id, command.actorId))
+    ) {
+      return "NOT_MEMBER";
+    }
+    return null;
+  }
+
+  async uploadTarget(command: ArtifactUploadCommand): Promise<ArtifactUploadTarget> {
+    const cap = await this.uploadCapability(command);
+    if (!cap || cap.status !== "pending" || cap.expires_at < Date.now()) {
+      return deniedUploadTarget("UPLOAD_CAPABILITY_INVALID");
+    }
+    const version = this.versionBy(cap.artifact_id, cap.version);
+    if (!version || version.status !== "pending") {
+      return deniedUploadTarget("UPLOAD_CAPABILITY_INVALID");
+    }
+    const authority = await this.uploadAuthority(cap, version);
+    if (authority) return deniedUploadTarget(authority);
+    return {
+      decision: "ALLOW",
+      reason: "ALLOWED",
+      r2Key: version.r2_key,
+      sha256: version.sha256,
+      size: version.size,
+      mediaType: version.media_type,
+    };
+  }
+
+  async commitUpload(command: ArtifactUploadCommand): Promise<ArtifactResult> {
+    const cap = await this.uploadCapability(command);
+    if (!cap) {
+      return denied("UPLOAD_CAPABILITY_INVALID");
+    }
+    const version = this.versionBy(cap.artifact_id, cap.version);
+    const artifactCommand = this.artifactCommand(cap, version);
+    if (!version || !artifactCommand) {
+      return denied("UPLOAD_CAPABILITY_INVALID");
+    }
+    const authority = await this.uploadAuthority(cap, version);
+    if (authority) return denied(authority);
+    if (version.status === "stored") {
+      const artifact = this.artifactById(version.artifact_id);
+      return allowed(version, artifact?.canonical_version ?? version.version, true);
+    }
+    if (cap.status !== "pending" || cap.expires_at < Date.now()) {
+      return denied("UPLOAD_CAPABILITY_INVALID");
+    }
+    const object = await this.env.ARTIFACTS.head(version.r2_key);
+    if (!object) {
+      return denied("UPLOAD_MISSING");
+    }
+    if (object.size !== version.size) {
+      return denied("CHECKSUM_MISMATCH");
+    }
+    if (
+      object.customMetadata?.sha256 !== version.sha256 ||
+      object.httpMetadata?.contentType !== version.media_type
+    ) {
+      return denied("CHECKSUM_MISMATCH");
+    }
+    const nativeChecksum = object.checksums.sha256;
+    let actualChecksum: string;
+    if (nativeChecksum) {
+      actualChecksum = toHex(new Uint8Array(nativeChecksum));
+    } else {
+      const stored = await this.env.ARTIFACTS.get(version.r2_key);
+      if (!stored) {
+        return denied("UPLOAD_MISSING");
+      }
+      actualChecksum = await sha256Bytes(new Uint8Array(await stored.arrayBuffer()));
+    }
+    if (!sameSecret(actualChecksum, version.sha256)) {
+      return denied("CHECKSUM_MISMATCH");
+    }
+    try {
+      await this.finishReserved(artifactCommand, version);
+    } catch (error) {
+      if (storageText(error).includes("ARTIFACT_PROJECTION_BOUNDARY")) {
+        return denied("TENANT_BOUNDARY");
+      }
+      throw error;
+    }
+    const artifact = this.artifactById(version.artifact_id);
+    return allowed(version, artifact?.canonical_version ?? version.version, false);
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    const pending = this.ctx.storage.sql
+      .exec<{ event_id: string; body: string; outbox: OutboxTable }>(
+        `SELECT event_id, body, 'event_outbox' AS outbox FROM event_outbox
+         WHERE status = 'pending' AND COALESCE(next_retry_at, 0) <= ?
+         UNION ALL
+         SELECT event_id, body, 'governance_outbox' AS outbox FROM governance_outbox
+         WHERE status = 'pending' AND COALESCE(next_retry_at, 0) <= ?`,
+        now,
+        now,
+      )
+      .toArray();
+    for (const item of pending) {
+      await this.deliverOutbox(item.outbox, item.event_id, item.body);
+    }
+    await this.scheduleOutboxAlarm();
   }
 
   async read(command: ArtifactRead): Promise<ArtifactReadResult> {
@@ -588,6 +1035,28 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     const object = await this.env.ARTIFACTS.get(version.r2_key);
     if (!object || object.size !== version.size) {
       return denyRead("INTEGRITY", artifact, version);
+    }
+    if (command.metadataOnly) {
+      const checksum = object.checksums.sha256;
+      const actual = checksum
+        ? toHex(new Uint8Array(checksum))
+        : await this.readObjectChecksum(version.r2_key);
+      if (!actual || !sameSecret(actual, version.sha256)) {
+        return denyRead("INTEGRITY", artifact, version);
+      }
+      return {
+        decision: "ALLOW",
+        reason: "ALLOWED",
+        artifactId: artifact.id,
+        version: version.version,
+        canonicalVersion: artifact.canonical_version,
+        r2Key: version.r2_key,
+        sha256: version.sha256,
+        mediaType: version.media_type,
+        size: version.size,
+        filename: version.filename,
+        bodyBase64: null,
+      };
     }
     const bytes = new Uint8Array(await object.arrayBuffer());
     const actual = await sha256Bytes(bytes);
@@ -651,6 +1120,56 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     return { armed: true };
   }
 
+  async outboxStateForTest(): Promise<
+    Array<{ eventId: string; status: string; attempts: number; failureReason: string | null }>
+  > {
+    if (!this.testMode()) {
+      return [];
+    }
+    return this.ctx.storage.sql
+      .exec<{
+        event_id: string;
+        status: string;
+        attempts: number;
+        failure_reason: string | null;
+      }>(
+        `SELECT event_id, status, attempts, failure_reason FROM event_outbox
+         UNION ALL
+         SELECT event_id, status, attempts, failure_reason FROM governance_outbox`,
+      )
+      .toArray()
+      .map((row) => ({
+        eventId: row.event_id,
+        status: row.status,
+        attempts: row.attempts,
+        failureReason: row.failure_reason,
+      }));
+  }
+
+  async corruptPendingOutboxForTest(): Promise<boolean> {
+    if (!this.testMode()) {
+      return false;
+    }
+    const pending = this.ctx.storage.sql
+      .exec<{ event_id: string; outbox: OutboxTable }>(
+        `SELECT event_id, 'event_outbox' AS outbox FROM event_outbox WHERE status = 'pending'
+         UNION ALL
+         SELECT event_id, 'governance_outbox' AS outbox FROM governance_outbox WHERE status = 'pending'
+         LIMIT 1`,
+      )
+      .toArray()[0];
+    if (!pending) {
+      return false;
+    }
+    this.ctx.storage.sql.exec(
+      `UPDATE ${pending.outbox} SET body = '{invalid', next_retry_at = 0
+       WHERE event_id = ? AND status = 'pending'`,
+      pending.event_id,
+    );
+    await this.scheduleOutboxAlarm();
+    return true;
+  }
+
   private async finish(
     command: ArtifactPut,
     version: VersionRow,
@@ -667,16 +1186,13 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
       throw new Error("ARTIFACT_OBJECT_UNAVAILABLE");
     }
     try {
-      await this.project(command.orgId, version, command.actorType, command.actorId);
+      await this.finishReserved(command, version);
     } catch (error) {
-      if (storageText(error).includes("TENANT_MISMATCH")) {
-        this.sealDenial(command, version, "TENANT_BOUNDARY");
+      if (storageText(error).includes("ARTIFACT_PROJECTION_BOUNDARY")) {
         return denied("TENANT_BOUNDARY");
       }
       throw error;
     }
-    this.markStored(command, version);
-    await this.publishStaged(command);
     const artifact = this.artifactById(version.artifact_id);
     return allowed(version, artifact?.canonical_version ?? version.version, false);
   }
@@ -688,11 +1204,13 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     media: string,
   ): Promise<"written" | "adopted" | "mismatch" | "failed"> {
     const orgId = this.bound()?.orgId;
-    if (!orgId || !key.startsWith(`org/${orgId}/`)) {
+    const checksum = fromHex(sha);
+    if (!orgId || !key.startsWith(`org/${orgId}/`) || !checksum) {
       return "failed";
     }
     const created = await this.env.ARTIFACTS.put(key, bytes, {
       onlyIf: { etagDoesNotMatch: "*" },
+      sha256: checksum,
       httpMetadata: { contentType: media },
       customMetadata: { sha256: sha },
     });
@@ -717,6 +1235,14 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     const stored = new Uint8Array(await object.arrayBuffer());
     const actual = await sha256Bytes(stored);
     return sameSecret(actual, sha) ? "adopted" : "mismatch";
+  }
+
+  private async readObjectChecksum(key: string): Promise<string | null> {
+    const object = await this.env.ARTIFACTS.get(key);
+    if (!object) {
+      return null;
+    }
+    return sha256Bytes(new Uint8Array(await object.arrayBuffer()));
   }
 
   private async project(
@@ -813,12 +1339,13 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
   }
 
   private claim(
-    command: ArtifactPut,
+    command: ArtifactCommand,
     roomId: string,
     taskId: string | null,
     parsed: ParsedPut,
     sha: string,
     size: number,
+    correlationId: string,
   ): VersionRow | null {
     const freshId = parsed.artifactId ?? createId("art");
     let reserved: VersionRow | null = null;
@@ -836,6 +1363,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
         version: versionNumber,
         room_id: roomId,
         task_id: taskId,
+        correlation_id: correlationId,
         r2_key: artifactObjectKey(command.orgId, roomId, artifactId, versionNumber),
         sha256: sha,
         media_type: parsed.mediaType,
@@ -855,7 +1383,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
   }
 
   private replay(
-    command: ArtifactPut,
+    command: ArtifactCommand,
     sha: string,
     roomId: string,
     taskId: string | null,
@@ -894,7 +1422,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     return { kind: "pending", version };
   }
 
-  private sealDenial(command: ArtifactPut, version: VersionRow, reason: string): void {
+  private sealDenial(command: ArtifactCommand, version: VersionRow, reason: string): void {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
         `UPDATE artifact_versions SET status = 'blocked'
@@ -914,7 +1442,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     });
   }
 
-  private markStored(command: ArtifactPut, version: VersionRow): void {
+  private async markStored(command: ArtifactCommand, version: VersionRow): Promise<void> {
     const at = new Date().toISOString();
     this.ctx.storage.transactionSync(() => {
       const current = this.commandByKey(command);
@@ -925,14 +1453,16 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
       if (!artifact) {
         this.ctx.storage.sql.exec(
           `INSERT INTO artifacts (
-            id, room_id, task_id, creator_type, creator_id, canonical_version, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            id, room_id, task_id, creator_type, creator_id, canonical_version, correlation_id,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           version.artifact_id,
           version.room_id,
           version.task_id,
           command.actorType,
           command.actorId,
           version.version,
+          version.correlation_id,
           at,
           at,
         );
@@ -951,6 +1481,11 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
         version.artifact_id,
         version.version,
       );
+      this.ctx.storage.sql.exec(
+        `UPDATE upload_capabilities SET status = 'stored' WHERE artifact_id = ? AND version = ?`,
+        version.artifact_id,
+        version.version,
+      );
       this.stageEvent(command, version, at);
       this.ctx.storage.sql.exec(
         `UPDATE artifact_commands
@@ -961,15 +1496,18 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
         command.idempotencyKey,
       );
     });
+    await this.scheduleOutboxAlarm();
   }
 
-  private stageEvent(command: ArtifactPut, version: VersionRow, at: string): void {
+  private stageEvent(command: ArtifactCommand, version: VersionRow, at: string): void {
     const event = buildArtifactEvent({
       orgId: command.orgId,
       actorType: command.actorType,
       actorId: command.actorId,
       idempotencyKey: command.idempotencyKey,
       occurredAt: at,
+      correlationId: version.correlation_id,
+      causationId: command.idempotencyKey,
       roomId: version.room_id,
       artifactId: version.artifact_id,
       version: version.version,
@@ -990,24 +1528,12 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     );
   }
 
-  private async publishStaged(command: ArtifactPut): Promise<void> {
+  private async publishStaged(command: ArtifactCommand): Promise<void> {
     const pending = this.outboxByCommand(command);
     if (!pending || pending.status !== "pending") {
       return;
     }
-    const event = parseDomainEvent(readJson(pending.body));
-    if (!event || this.consumePublishFault()) {
-      return;
-    }
-    try {
-      await this.env.DOMAIN_EVENTS.send(event);
-    } catch {
-      return;
-    }
-    this.ctx.storage.sql.exec(
-      `UPDATE event_outbox SET status = 'sent' WHERE event_id = ? AND status = 'pending'`,
-      event.event_id,
-    );
+    await this.deliverOutbox("event_outbox", pending.event_id, pending.body);
   }
 
   private async authorize(
@@ -1034,7 +1560,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     };
   }
 
-  private async canRevise(command: ArtifactPut, artifact: ArtifactRow): Promise<boolean> {
+  private async canRevise(command: ArtifactCommand, artifact: ArtifactRow): Promise<boolean> {
     if (command.actorType === artifact.creator_type && command.actorId === artifact.creator_id) {
       return true;
     }
@@ -1058,11 +1584,55 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     return row !== null;
   }
 
-  private async taskInOrg(orgId: string, taskId: string): Promise<boolean> {
-    const row = await this.env.DB.prepare(`SELECT id FROM tasks WHERE org_id = ? AND id = ?`)
-      .bind(orgId, taskId)
-      .first<{ id: string }>();
-    return row !== null;
+  private async taskInRoom(
+    orgId: string,
+    taskId: string,
+    roomId: string,
+  ): Promise<
+    | { decision: "ALLOW"; reason: "ALLOWED"; correlationId: string }
+    | { decision: "DENY"; reason: "ROOM_MISMATCH" | "TENANT_BOUNDARY" }
+  > {
+    let task: { id: string; correlation_id: string | null } | null;
+    try {
+      task = await this.env.DB.prepare(
+        `SELECT id, correlation_id FROM tasks
+         WHERE org_id = ? AND id = ? AND room_id = ?`,
+      )
+        .bind(orgId, taskId, roomId)
+        .first<{ id: string; correlation_id: string | null }>();
+    } catch (error) {
+      const detail = storageText(error).toLowerCase();
+      if (!detail.includes("correlation_id")) {
+        throw error;
+      }
+      task = await this.env.DB.prepare(
+        `SELECT id, NULL AS correlation_id FROM tasks
+         WHERE org_id = ? AND id = ? AND room_id = ?`,
+      )
+        .bind(orgId, taskId, roomId)
+        .first<{ id: string; correlation_id: null }>();
+    }
+    if (!task) {
+      const exists = await this.env.DB.prepare(`SELECT id FROM tasks WHERE org_id = ? AND id = ?`)
+        .bind(orgId, taskId)
+        .first<{ id: string }>();
+      return {
+        decision: "DENY",
+        reason: exists ? "ROOM_MISMATCH" : "TENANT_BOUNDARY",
+      };
+    }
+    let correlationId = task.correlation_id;
+    if (!correlationId) {
+      const firstEvent = await this.env.DB.prepare(
+        `SELECT correlation_id FROM domain_events
+         WHERE org_id = ? AND subject_type = 'task' AND subject_id = ?
+         ORDER BY seq ASC, occurred_at ASC LIMIT 1`,
+      )
+        .bind(orgId, taskId)
+        .first<{ correlation_id: string }>();
+      correlationId = firstEvent?.correlation_id ?? createId("corr");
+    }
+    return { decision: "ALLOW", reason: "ALLOWED", correlationId };
   }
 
   private async activeMember(orgId: string, roomId: string, employeeId: string): Promise<boolean> {
@@ -1107,11 +1677,89 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     return true;
   }
 
+  private async deliverOutbox(table: OutboxTable, eventId: string, body: string): Promise<void> {
+    const event = parseDomainEvent(readJson(body));
+    if (!event) {
+      this.ctx.storage.sql.exec(
+        `UPDATE ${table} SET status = 'failed', failure_reason = 'INVALID_EVENT', next_retry_at = NULL
+         WHERE event_id = ? AND status = 'pending'`,
+        eventId,
+      );
+      await this.scheduleOutboxAlarm();
+      return;
+    }
+    if (this.consumePublishFault()) {
+      await this.retryOutbox(table, eventId, "QUEUE_SEND_FAILED");
+      return;
+    }
+    try {
+      await this.env.DOMAIN_EVENTS.send(event);
+    } catch {
+      await this.retryOutbox(table, eventId, "QUEUE_SEND_FAILED");
+      return;
+    }
+    this.ctx.storage.sql.exec(
+      `UPDATE ${table}
+       SET status = 'sent', next_retry_at = NULL, failure_reason = NULL
+       WHERE event_id = ? AND status = 'pending'`,
+      eventId,
+    );
+    await this.scheduleOutboxAlarm();
+  }
+
+  private async retryOutbox(
+    table: OutboxTable,
+    eventId: string,
+    reason: "QUEUE_SEND_FAILED",
+  ): Promise<void> {
+    const current = this.ctx.storage.sql
+      .exec<{ attempts: number }>(`SELECT attempts FROM ${table} WHERE event_id = ?`, eventId)
+      .toArray()[0];
+    if (!current) {
+      return;
+    }
+    const attempts = current.attempts + 1;
+    const delay =
+      OUTBOX_RETRY_DELAYS_MS[Math.min(attempts - 1, OUTBOX_RETRY_DELAYS_MS.length - 1)] ?? 300_000;
+    this.ctx.storage.sql.exec(
+      `UPDATE ${table}
+       SET attempts = ?, next_retry_at = ?, failure_reason = ?
+       WHERE event_id = ? AND status = 'pending'`,
+      attempts,
+      Date.now() + delay,
+      reason,
+      eventId,
+    );
+    await this.scheduleOutboxAlarm();
+  }
+
+  private async scheduleOutboxAlarm(): Promise<void> {
+    const next = this.ctx.storage.sql
+      .exec<{ at: number | null }>(
+        `SELECT MIN(at) AS at FROM (
+           SELECT COALESCE(next_retry_at, 0) AS at FROM event_outbox WHERE status = 'pending'
+           UNION ALL
+           SELECT COALESCE(next_retry_at, 0) AS at FROM governance_outbox WHERE status = 'pending'
+         )`,
+      )
+      .toArray()[0]?.at;
+    if (next === null || next === undefined) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const alarm = await this.ctx.storage.getAlarm();
+    const scheduled = Math.max(Date.now() + 1, next);
+    if (alarm !== scheduled) {
+      await this.ctx.storage.setAlarm(scheduled);
+    }
+  }
+
   private artifactById(id: string): ArtifactRow | null {
     return (
       this.ctx.storage.sql
         .exec<ArtifactRow>(
-          `SELECT id, room_id, task_id, creator_type, creator_id, canonical_version, created_at, updated_at
+          `SELECT id, room_id, task_id, creator_type, creator_id, canonical_version, correlation_id,
+                  created_at, updated_at
            FROM artifacts WHERE id = ?`,
           id,
         )
@@ -1123,7 +1771,8 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     return (
       this.ctx.storage.sql
         .exec<VersionRow>(
-          `SELECT artifact_id, version, room_id, task_id, r2_key, sha256, media_type, size, filename, status, created_at
+          `SELECT artifact_id, version, room_id, task_id, correlation_id, r2_key, sha256, media_type,
+                  size, filename, status, created_at
            FROM artifact_versions WHERE artifact_id = ? AND version = ?`,
           artifactId,
           version,
@@ -1142,7 +1791,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     return row?.version ?? 0;
   }
 
-  private commandByKey(command: ArtifactPut): CommandRow | null {
+  private commandByKey(command: ArtifactCommand): CommandRow | null {
     return (
       this.ctx.storage.sql
         .exec<CommandRow>(
@@ -1158,7 +1807,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
   }
 
   private outboxByCommand(
-    command: ArtifactPut,
+    command: ArtifactCommand,
   ): { event_id: string; body: string; status: string } | null {
     return (
       this.ctx.storage.sql
@@ -1176,12 +1825,14 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
   private insertVersion(row: VersionRow): void {
     this.ctx.storage.sql.exec(
       `INSERT INTO artifact_versions (
-        artifact_id, version, room_id, task_id, r2_key, sha256, media_type, size, filename, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        artifact_id, version, room_id, task_id, correlation_id, r2_key, sha256, media_type,
+        size, filename, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       row.artifact_id,
       row.version,
       row.room_id,
       row.task_id,
+      row.correlation_id,
       row.r2_key,
       row.sha256,
       row.media_type,
@@ -1192,7 +1843,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     );
   }
 
-  private insertCommand(command: ArtifactPut, row: VersionRow): void {
+  private insertCommand(command: ArtifactCommand, row: VersionRow): void {
     this.ctx.storage.sql.exec(
       `INSERT INTO artifact_commands (
         actor_type, actor_id, idempotency_key, requested_artifact_id, artifact_id, version, sha256,
@@ -1298,7 +1949,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     }
     const recordId = createId(plan.kind === "review" ? "rev" : "apr");
     const eventId = createId("evt");
-    const correlationId = createId("corr");
+    const correlationId = plan.artifact.correlation_id;
     const createdAt = new Date().toISOString();
     const afterDigest = await sha256Hex(
       digestSource({
@@ -1372,6 +2023,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
       afterDigest: row.after_digest,
     });
     this.sealGovernance(plan.actor, row, event);
+    await this.scheduleOutboxAlarm();
     await this.publishGovernance(plan.actor);
     const stored = this.governanceByKey(plan.actor);
     return governanceFrom(stored ?? row, false);
@@ -1639,19 +2291,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
     if (!pending || pending.status !== "pending") {
       return;
     }
-    const event = parseDomainEvent(readJson(pending.body));
-    if (!event || this.consumePublishFault()) {
-      return;
-    }
-    try {
-      await this.env.DOMAIN_EVENTS.send(event);
-    } catch {
-      return;
-    }
-    this.ctx.storage.sql.exec(
-      `UPDATE governance_outbox SET status = 'sent' WHERE event_id = ? AND status = 'pending'`,
-      event.event_id,
-    );
+    await this.deliverOutbox("governance_outbox", pending.event_id, pending.body);
   }
 
   private previousDigest(artifactId: string, version: number, kind: GovernanceKind): string | null {
@@ -1746,6 +2386,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
       creator_type TEXT NOT NULL,
       creator_id TEXT NOT NULL,
       canonical_version INTEGER NOT NULL,
+      correlation_id TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )`);
@@ -1754,6 +2395,7 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
       version INTEGER NOT NULL,
       room_id TEXT NOT NULL,
       task_id TEXT,
+      correlation_id TEXT NOT NULL DEFAULT '',
       r2_key TEXT NOT NULL UNIQUE,
       sha256 TEXT NOT NULL,
       media_type TEXT NOT NULL,
@@ -1783,6 +2425,9 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
       idempotency_key TEXT NOT NULL,
       body TEXT NOT NULL,
       status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_retry_at INTEGER,
+      failure_reason TEXT,
       UNIQUE (actor_type, actor_id, idempotency_key)
     )`);
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS publish_fault (
@@ -1845,7 +2490,45 @@ export class ArtifactDO extends DurableObject<ArtifactEnv> {
       idempotency_key TEXT NOT NULL,
       body TEXT NOT NULL,
       status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_retry_at INTEGER,
+      failure_reason TEXT,
       UNIQUE (actor_type, actor_id, idempotency_key)
     )`);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS upload_capabilities (
+      token_hash TEXT PRIMARY KEY,
+      actor_type TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      artifact_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      status TEXT NOT NULL
+    )`);
+    this.ensureColumn("artifacts", "correlation_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("artifact_versions", "correlation_id", "TEXT NOT NULL DEFAULT ''");
+    for (const table of ["event_outbox", "governance_outbox"] as const) {
+      this.ensureColumn(table, "attempts", "INTEGER NOT NULL DEFAULT 0");
+      this.ensureColumn(table, "next_retry_at", "INTEGER");
+      this.ensureColumn(table, "failure_reason", "TEXT");
+    }
+    this.ctx.storage.sql.exec(
+      `UPDATE artifacts SET correlation_id = 'corr_legacy_' || id WHERE correlation_id = ''`,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE artifact_versions
+       SET correlation_id = (SELECT correlation_id FROM artifacts WHERE id = artifact_id)
+       WHERE correlation_id = ''`,
+    );
+  }
+
+  private ensureColumn(table: string, column: string, declaration: string): void {
+    const exists = this.ctx.storage.sql
+      .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+      .toArray()
+      .some((item) => item.name === column);
+    if (!exists) {
+      this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
+    }
   }
 }
