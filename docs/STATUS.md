@@ -1,5 +1,14 @@
 # Status
 
+## Staging P1 remediation
+
+State: `ROOMAGENT_STAGING_P1_REMEDIATION_AWAITING_INDEPENDENT_REVIEW`.
+
+P1-01 through P1-05 are implemented with local regression coverage on top of the merged
+remediation v1 (`main` `dee1e56`). The record is
+[staging-p1-remediation.md](reports/staging-p1-remediation.md). Nothing was deployed or
+provisioned. Staging is not ready until an operator provisions it and the remote checks pass.
+
 ## Architecture remediation v1
 
 State: `ROOMAGENT_REMEDIATION_IMPLEMENTED_AWAITING_INDEPENDENT_REVIEW`.

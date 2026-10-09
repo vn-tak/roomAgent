@@ -3,7 +3,14 @@ import { env } from "cloudflare:workers";
 import { introspectWorkflowInstance } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { ProductionTaskParams } from "../src/production-task-workflow";
-import { artifactStub, createStudio, hire, organizationStub, taskStub } from "./helpers";
+import {
+  artifactStub,
+  claimWorkflowStart,
+  createStudio,
+  hire,
+  organizationStub,
+  taskStub,
+} from "./helpers";
 
 interface EventPayload {
   [key: string]: unknown;
@@ -328,6 +335,7 @@ describe("certified POC audit replay", () => {
         roomId: room.id,
         correlationId,
       };
+      await claimWorkflowStart(workflowRunId, params);
       await env.PRODUCTION_TASK.create({ id: workflowRunId, params });
       await workflow.waitForStatus("complete");
       const completedRun = await env.DB.prepare(

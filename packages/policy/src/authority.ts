@@ -54,6 +54,8 @@ const ACTION_PERMISSION: Readonly<Record<string, PermissionCode>> = {
   "security.block.create": "security.block",
   "security.block.clear": "security.block",
   "security.block.override": "override.security",
+  // Starting a governed workflow is task orchestration; no role gains a new permission.
+  "workflow.start": "task.assign",
 };
 
 const SELF_APPROVAL_ACTIONS = new Set(["artifact.approve", "artifact.final_approve"]);

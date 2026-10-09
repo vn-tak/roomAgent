@@ -23,3 +23,8 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: python3 scripts/test-migrations.py
+      - run: python3 scripts/test-d1-preflight.py
+      - run: python3 scripts/d1_preflight.py manifest
+      - run: python3 scripts/d1_preflight.py config
+      # Local bundle/config validation only; no credentials exist in CI and nothing is deployed.
+      - run: pnpm --filter @ai-company/api exec wrangler deploy --dry-run --config wrangler.staging.jsonc --outdir "$RUNNER_TEMP/staging-dry-run"

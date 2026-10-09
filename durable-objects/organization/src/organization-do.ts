@@ -101,6 +101,7 @@ type MetaRow = {
 const SEVERITIES = new Set(["low", "medium", "high", "critical"]);
 const JOIN_WINDOW_MS = 60_000;
 const JOIN_FAILURE_LIMIT = 5;
+const HUMAN_ACCESS_SESSION_MAX_SECONDS = 900;
 
 type JoinRow = {
   id: string;
@@ -146,8 +147,79 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
 
   // Trusted RPC bootstrap only; HTTP never accepts a claimed human identity.
   async issueHumanSession(command: ActorCommand & { ttlSeconds: number }) {
+    return this.issueSession(command, command.ttlSeconds, 3600, null, "trusted_rpc");
+  }
+
+  // Called only after the Worker verified a Cloudflare Access JWT and resolved the
+  // operator-provisioned identity mapping server-side.
+  async issueAccessHumanSession(command: {
+    orgId: string;
+    userId: string;
+    identityId: string;
+    ttlSeconds: number;
+  }) {
+    if (!/^hid_[0-9a-f]{32}$/.test(command.identityId)) {
+      return { decision: "DENY" as const, reason: "INVALID_INPUT", token: null, sessionId: null };
+    }
+    return this.issueSession(
+      { orgId: command.orgId, actorType: "human", actorId: command.userId },
+      command.ttlSeconds,
+      HUMAN_ACCESS_SESSION_MAX_SECONDS,
+      command.identityId,
+      "cloudflare_access",
+    );
+  }
+
+  async verifyHumanSession(command: { orgId: string; token: string }) {
+    if (this.boundary(command.orgId) || !/^hum_[0-9a-f]{64}$/.test(command.token)) {
+      return {
+        decision: "DENY" as const,
+        reason: "SESSION_INVALID",
+        userId: null,
+        sessionId: null,
+      };
+    }
+    const row = await this.env.DB.prepare(
+      `SELECT s.id, s.user_id FROM human_sessions s
+       JOIN organizations o ON o.id = s.org_id AND o.status = 'active'
+       LEFT JOIN human_identities i ON i.id = s.identity_id
+       WHERE s.org_id = ? AND s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+         AND (s.identity_id IS NULL OR (i.status = 'active' AND i.user_id = s.user_id))`,
+    )
+      .bind(command.orgId, await sha256Hex(command.token), this.now())
+      .first<{ id: string; user_id: string }>();
+    return row
+      ? { decision: "ALLOW" as const, reason: "ALLOWED", userId: row.user_id, sessionId: row.id }
+      : { decision: "DENY" as const, reason: "SESSION_INVALID", userId: null, sessionId: null };
+  }
+
+  async revokeHumanSession(command: ActorCommand & { sessionId: string }) {
     const gate = await this.gate(command, "runtime.bind");
-    if (gate.decision === "DENY" || command.actorType !== "human") {
+    if (gate.decision === "DENY") return gate;
+    if (command.actorType !== "human") return deny("NO_PERMISSION", gate.policy_version);
+    await this.revokeSession(command.orgId, command.sessionId, command.actorId);
+    return gate;
+  }
+
+  // Self-revocation by bearer token; a session can always end itself.
+  async revokeHumanSessionToken(command: { orgId: string; token: string }) {
+    const verified = await this.verifyHumanSession(command);
+    if (verified.decision === "DENY" || !verified.sessionId || !verified.userId) {
+      return { decision: "DENY" as const, reason: "SESSION_INVALID", sessionId: null };
+    }
+    await this.revokeSession(command.orgId, verified.sessionId, verified.userId);
+    return { decision: "ALLOW" as const, reason: "ALLOWED", sessionId: verified.sessionId };
+  }
+
+  private async issueSession(
+    actor: ActorCommand,
+    ttlSeconds: number,
+    maxTtlSeconds: number,
+    identityId: string | null,
+    method: "trusted_rpc" | "cloudflare_access",
+  ) {
+    const gate = await this.gate(actor, "runtime.bind");
+    if (gate.decision === "DENY" || actor.actorType !== "human") {
       return {
         decision: "DENY" as const,
         reason: "PERMISSION_DENIED",
@@ -155,58 +227,68 @@ export class OrganizationDO extends DurableObject<OrganizationEnv> {
         sessionId: null,
       };
     }
-    if (
-      !Number.isInteger(command.ttlSeconds) ||
-      command.ttlSeconds < 1 ||
-      command.ttlSeconds > 3600
-    ) {
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > maxTtlSeconds) {
       return { decision: "DENY" as const, reason: "INVALID_INPUT", token: null, sessionId: null };
+    }
+    const organization = await this.env.DB.prepare(`SELECT status FROM organizations WHERE id = ?`)
+      .bind(actor.orgId)
+      .first<{ status: string }>();
+    if (organization?.status !== "active") {
+      return {
+        decision: "DENY" as const,
+        reason: "ORGANIZATION_SUSPENDED",
+        token: null,
+        sessionId: null,
+      };
     }
     const token = `hum_${randomSecret()}`;
     const sessionId = createId("ses");
-    const expiresAt = new Date(Date.now() + command.ttlSeconds * 1000).toISOString();
-    await this.env.DB.prepare(
-      `INSERT INTO human_sessions (id, org_id, user_id, token_hash, expires_at, revoked_at, created_at)
-       VALUES (?, ?, ?, ?, ?, NULL, ?)`,
-    )
-      .bind(
+    const createdAt = this.now();
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        `INSERT INTO human_sessions
+           (id, org_id, user_id, token_hash, expires_at, revoked_at, created_at, identity_id)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`,
+      ).bind(
         sessionId,
-        command.orgId,
-        command.actorId,
+        actor.orgId,
+        actor.actorId,
         await sha256Hex(token),
         expiresAt,
-        this.now(),
-      )
-      .run();
+        createdAt,
+        identityId,
+      ),
+      this.env.DB.prepare(
+        `INSERT INTO human_session_audit
+           (id, org_id, session_id, user_id, identity_id, action, method, recorded_at)
+         VALUES (?, ?, ?, ?, ?, 'issued', ?, ?)`,
+      ).bind(createId("evt"), actor.orgId, sessionId, actor.actorId, identityId, method, createdAt),
+    ]);
     return { decision: "ALLOW" as const, reason: "ALLOWED", token, sessionId, expiresAt };
   }
 
-  async verifyHumanSession(command: { orgId: string; token: string }) {
-    if (this.boundary(command.orgId) || !/^hum_[0-9a-f]{64}$/.test(command.token)) {
-      return { decision: "DENY" as const, reason: "SESSION_INVALID", userId: null };
-    }
-    const row = await this.env.DB.prepare(
-      `SELECT s.user_id FROM human_sessions s
-       JOIN organizations o ON o.id = s.org_id AND o.status = 'active'
-       WHERE s.org_id = ? AND s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?`,
-    )
-      .bind(command.orgId, await sha256Hex(command.token), this.now())
-      .first<{ user_id: string }>();
-    return row
-      ? { decision: "ALLOW" as const, reason: "ALLOWED", userId: row.user_id }
-      : { decision: "DENY" as const, reason: "SESSION_INVALID", userId: null };
-  }
-
-  async revokeHumanSession(command: ActorCommand & { sessionId: string }) {
-    const gate = await this.gate(command, "runtime.bind");
-    if (gate.decision === "DENY") return gate;
-    if (command.actorType !== "human") return deny("NO_PERMISSION", gate.policy_version);
-    await this.env.DB.prepare(
-      `UPDATE human_sessions SET revoked_at = ? WHERE org_id = ? AND id = ? AND user_id = ?`,
-    )
-      .bind(this.now(), command.orgId, command.sessionId, command.actorId)
-      .run();
-    return gate;
+  private async revokeSession(orgId: string, sessionId: string, userId: string): Promise<void> {
+    const at = this.now();
+    // The audit row is written only when this batch performed the revocation.
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        `UPDATE human_sessions SET revoked_at = ?
+         WHERE org_id = ? AND id = ? AND user_id = ? AND revoked_at IS NULL`,
+      ).bind(at, orgId, sessionId, userId),
+      this.env.DB.prepare(
+        `INSERT INTO human_session_audit
+           (id, org_id, session_id, user_id, identity_id, action, method, recorded_at)
+         SELECT ?, org_id, id, user_id, identity_id, 'revoked',
+                CASE WHEN identity_id IS NULL THEN 'trusted_rpc' ELSE 'cloudflare_access' END, ?
+         FROM human_sessions
+         WHERE org_id = ? AND id = ? AND user_id = ? AND revoked_at = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM human_session_audit
+             WHERE session_id = ? AND action = 'revoked'
+           )`,
+      ).bind(createId("evt"), at, orgId, sessionId, userId, at, sessionId),
+    ]);
   }
 
   async assignRole(command: AssignRoleCommand): Promise<AuthorityDecision> {

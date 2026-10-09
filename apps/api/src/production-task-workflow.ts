@@ -214,6 +214,8 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
   }
 
   private async registerRun(runId: string, plan: ProductionPlan): Promise<CompletionPolicy | null> {
+    // An instance without a durable start claim (for example one triggered outside the API)
+    // is untraceable and never registers.
     const row = await this.env.DB.prepare(
       `SELECT artifacts.creator_type AS creator_type,
               artifacts.creator_id AS creator_id,
@@ -228,6 +230,13 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
          ON artifact_versions.org_id = artifacts.org_id
         AND artifact_versions.artifact_id = artifacts.id
         AND artifact_versions.version = ?
+       INNER JOIN workflow_start_claims AS claims
+         ON claims.org_id = artifacts.org_id
+        AND claims.id = ?
+        AND claims.task_id = tasks.id
+        AND claims.artifact_id = artifacts.id
+        AND claims.artifact_version = artifact_versions.version
+        AND claims.state <> 'released'
        WHERE artifacts.org_id = ?
          AND artifacts.id = ?
          AND artifacts.task_id = ?
@@ -235,7 +244,7 @@ export class ProductionTaskWorkflow extends WorkflowEntrypoint<Env, ProductionTa
          AND tasks.room_id = ?
          AND tasks.state = 'REVIEW'`,
     )
-      .bind(plan.version, plan.orgId, plan.artifactId, plan.taskId, plan.roomId, plan.roomId)
+      .bind(plan.version, runId, plan.orgId, plan.artifactId, plan.taskId, plan.roomId, plan.roomId)
       .first<{
         creator_type: string;
         creator_id: string;

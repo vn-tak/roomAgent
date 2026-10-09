@@ -1,0 +1,92 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Staging only. Every resource name below is staging-specific; none points at production.
+  // Nothing here has been provisioned. See docs/reports/ROOMAGENT_DO_FIRST_DEPLOY_PLAN.md.
+  "name": "ai-company-os-api-staging",
+  "main": "src/index.ts",
+  "account_id": "ef250a88911fd24073cb73d1c07e0218",
+  "compatibility_date": "2026-10-08",
+  // Reachable only through an operator-approved, Access-protected route added at provisioning.
+  "workers_dev": false,
+  "preview_urls": false,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-company-os-staging",
+      // Placeholder until the operator provisions D1; the preflight refuses to pass on it.
+      "database_id": "REPLACE_WITH_PROVISIONED_STAGING_D1_UUID",
+      "migrations_dir": "../../migrations",
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "ORGANIZATION", "class_name": "OrganizationDO" },
+      { "name": "ROOM", "class_name": "RoomDO" },
+      { "name": "AGENT", "class_name": "AgentDO" },
+      { "name": "TASK", "class_name": "TaskDO" },
+      { "name": "ARTIFACT", "class_name": "ArtifactDO" },
+    ],
+  },
+  // Declarative SQLite classes, provisioned on first deploy. No legacy migrations entry.
+  "exports": {
+    "OrganizationDO": { "type": "durable-object", "storage": "sqlite" },
+    "RoomDO": { "type": "durable-object", "storage": "sqlite" },
+    "AgentDO": { "type": "durable-object", "storage": "sqlite" },
+    "TaskDO": { "type": "durable-object", "storage": "sqlite" },
+    "ArtifactDO": { "type": "durable-object", "storage": "sqlite" },
+  },
+  "r2_buckets": [
+    {
+      "binding": "ARTIFACTS",
+      "bucket_name": "ai-company-os-staging-artifacts",
+    },
+  ],
+  "workflows": [
+    {
+      "binding": "PRODUCTION_TASK",
+      "name": "ai-company-os-staging-production-task",
+      "class_name": "ProductionTaskWorkflow",
+    },
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "DOMAIN_EVENTS", "queue": "ai-company-os-staging-domain-events" },
+      { "binding": "AGENT_DELIVERY", "queue": "ai-company-os-staging-agent-delivery" },
+      { "binding": "DEAD_LETTER", "queue": "ai-company-os-staging-dead-letter" },
+    ],
+    "consumers": [
+      {
+        "queue": "ai-company-os-staging-domain-events",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0,
+        "max_retries": 2,
+        "retry_delay": 30,
+        "dead_letter_queue": "ai-company-os-staging-dead-letter",
+      },
+      {
+        "queue": "ai-company-os-staging-agent-delivery",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0,
+        "max_retries": 2,
+        "retry_delay": 30,
+        "dead_letter_queue": "ai-company-os-staging-dead-letter",
+      },
+      {
+        "queue": "ai-company-os-staging-dead-letter",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0,
+        "max_retries": 0,
+      },
+    ],
+  },
+  // Placeholders keep the operator bootstrap disabled (deny by default) until the
+  // operator creates the Access application and records its team domain and AUD tag.
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "REPLACE_WITH_ACCESS_TEAM_DOMAIN",
+    "ACCESS_AUD": "REPLACE_WITH_ACCESS_APPLICATION_AUD",
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+  },
+}

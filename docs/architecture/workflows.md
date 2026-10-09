@@ -34,7 +34,9 @@ The workflow does not publish a new domain event. Review and approval events sti
 
 ## Authority
 
-`workflow.approve` stays on the owner and executive templates. Employee, QA, and security do not receive it. A test-only custom role can hold it. There is no HTTP route for this workflow. Tests start it through the binding. A human session does not exist yet.
+`workflow.approve` stays on the owner and executive templates. Employee, QA, and security do not receive it. A test-only custom role can hold it.
+
+Runs start only through `POST /orgs/:orgId/tasks/:taskId/workflow-runs`. The action `workflow.start` requires `task.assign`. The route writes a durable `workflow_start_claims` row whose id is the instance id before it calls `create()`. `registerRun` refuses any instance without an unreleased claim. See [workflow-start-protocol.md](../reports/workflow-start-protocol.md).
 
 Parameters carry ids, a correlation id, and the structured QA results. They do not carry an objective, a filename, bytes, or review text. Logs do not record the event payload.
 

@@ -3,7 +3,14 @@ import { env } from "cloudflare:workers";
 import { introspectWorkflowInstance } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { QA_EVIDENCE_EVENT, type ProductionTaskParams } from "../src/production-task-workflow";
-import { artifactStub, createStudio, hire, organizationStub, taskStub } from "./helpers";
+import {
+  artifactStub,
+  claimWorkflowStart,
+  createStudio,
+  hire,
+  organizationStub,
+  taskStub,
+} from "./helpers";
 
 function ownerOf(org: Organization) {
   return { orgId: org.id, actorType: "human" as const, actorId: org.createdByUserId };
@@ -126,6 +133,7 @@ describe("workflow external evidence", () => {
         qaEmployeeId: qa.id,
         securityEmployeeId: worker.id,
       };
+      await claimWorkflowStart(runId, params);
       await env.PRODUCTION_TASK.create({ id: runId, params });
       await waitForStage(studio.org.id, runId, "qa_review");
       await (
