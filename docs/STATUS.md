@@ -1,5 +1,20 @@
 # Status
 
+## Architecture remediation v1
+
+State: `ROOMAGENT_REMEDIATION_IMPLEMENTED_AWAITING_INDEPENDENT_REVIEW`.
+
+Implementation is on `fix/architecture-remediation-v1`, based on the reviewed publication commit.
+R1–R17 have local regression coverage: 135 tests / 41 files PASS, plus two migration checks.
+Exact-head CI evidence is recorded on the remediation PR; no merge or deployment is authorized.
+The implementation and exact-head verification ledger is
+[architecture-remediation-v1.md](reports/architecture-remediation-v1.md).
+Historical phase gates below are not evidence for the new remediation.
+
+No staging/production deployment, remote Cloudflare mutation, or Muse/CUE contact is authorized.
+
+## Historical baseline (superseded where noted)
+
 Recorded: 2026-10-09
 
 Repository: https://github.com/vn-tak/roomAgent

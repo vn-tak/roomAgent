@@ -1,5 +1,28 @@
 # Threat model
 
+## Remediation trust boundaries
+
+The current remediation ledger is [architecture-remediation-v1.md](../reports/architecture-remediation-v1.md).
+OrganizationDO remains the sole RBAC decision engine. Structured backend commands, not
+chat, objectives, artifact text, or workflow event metadata, convey authority.
+
+Human bearer tokens are hashed at rest and resolve user identity server-side. Issuance
+is trusted internal RPC only; no public login or user-selected actor id is accepted.
+Employee tokens still require session and scope verification. Bootstrap role mutation
+is explicitly named `bootstrapAssignEmployeeRoleUnsafe`; production role commands
+must use OrganizationDO. Opaque join tokens remain 256-bit, one-use, and at most 600 seconds.
+
+Artifact upload capabilities bind the generated immutable key, actor, method, checksum,
+size, and short expiry. The large-byte path streams Worker-to-R2, not DO RPC. Bucket
+listing and client-chosen object keys are never granted. Operator access to D1/R2 remains
+a separate trust boundary; application guards do not defend against a malicious account owner.
+
+The table below is the historical phase baseline. Its statements about missing human
+sessions, ACK projections, outbox retries, budgets, and scripted workflows are superseded
+only by findings with passing evidence in the remediation report. Phase reports are unchanged.
+
+## Historical phase baseline
+
 Phase 1 covers identity storage. Phase 2 enforces organization authority in OrganizationDO. Phase 3 enforces room order in RoomDO. Phase 4 enforces join codes and runtime sessions. Phase 5 enforces the task state machine and the handoff loop guard. Phase 6 enforces idempotent queue delivery. Phase 7 enforces immutable artifact versions. Phase 8 stores review and approval records and rejects updates and deletes of audit history. Phase 9 runs one durable approval workflow and keeps permission checks in OrganizationDO. Phase 10 runs the six-employee company proof locally. Browser sessions are the only runtime used there. Muse and CUE are not contacted. Later phases must close the remaining rows before any production use.
 
 | Threat                         | Risk   | Attack path                                          | Mitigation now                                                                                                                                                                                                                                       | Residual risk                                                                                                                           | Test                                                                             |
