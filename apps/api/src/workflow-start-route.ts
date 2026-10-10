@@ -1,6 +1,8 @@
 import { createId, isId } from "@ai-company/domain";
 import type { Context, Hono } from "hono";
 import { resolveHttpPrincipal } from "./http-principal";
+import { FAULT_WORKFLOW_STATUS } from "./events/names";
+import { takeEventFault } from "./events/test-seam";
 import type { ProductionTaskParams } from "./production-task-workflow";
 
 type EnvVars = { Bindings: Env; Variables: { requestId: string } };
@@ -49,13 +51,22 @@ interface ClaimRow {
 }
 
 type Failure = {
-  status: 400 | 401 | 403 | 404 | 409;
+  status: 400 | 401 | 403 | 404 | 409 | 503;
   code: string;
   runId?: string;
   holdReason?: string;
 };
 
-type Settlement = { kind: "released" } | { kind: "active" } | { kind: "held"; reason: string };
+type Settlement =
+  | { kind: "released" }
+  | { kind: "active" }
+  | { kind: "held"; reason: string }
+  | { kind: "unavailable" };
+
+// `missing` only on an explicit not-found answer; every other lookup failure is `unknown`.
+type InstanceState = { kind: "found"; status: string } | { kind: "missing" } | { kind: "unknown" };
+
+const UNAVAILABLE = "WORKFLOW_STATUS_UNAVAILABLE";
 
 export function registerWorkflowStartRoutes(app: App): void {
   app.post("/orgs/:orgId/tasks/:taskId/workflow-runs", (c) => start(c));
@@ -123,6 +134,10 @@ async function start(c: StartContext): Promise<Response> {
     if (active) {
       const settled = await settle(c.env, orgId, active);
       if (settled.kind === "released") continue;
+      if (settled.kind === "unavailable") {
+        // Unknown instance state: keep the claim and create nothing; the caller retries.
+        return fail(c, { status: 503, code: UNAVAILABLE, runId: active.id });
+      }
       if (settled.kind === "held") {
         // A new idempotency key never clears a hold; only an explicit resolution does.
         return fail(c, {
@@ -132,7 +147,9 @@ async function start(c: StartContext): Promise<Response> {
           holdReason: settled.reason,
         });
       }
-      await ensureInstance(c.env, active.id, await paramsFor(c.env, orgId, active));
+      if (!(await ensureInstance(c.env, active.id, await paramsFor(c.env, orgId, active)))) {
+        return fail(c, { status: 503, code: UNAVAILABLE, runId: active.id });
+      }
       return fail(c, { status: 409, code: "WORKFLOW_ACTIVE", runId: active.id });
     }
     const legacy = await legacyActiveRun(c.env, orgId, taskId);
@@ -171,7 +188,10 @@ async function start(c: StartContext): Promise<Response> {
       continue;
     }
     // 11. Instance id equals the claim id, so a lost response or crash is reconcilable.
-    await ensureInstance(c.env, runId, eligible.params(runId));
+    if (!(await ensureInstance(c.env, runId, eligible.params(runId)))) {
+      // The claim stays 'claimed'; a retry with this key or any later start reconciles it.
+      return fail(c, { status: 503, code: UNAVAILABLE, runId });
+    }
     await c.env.DB.prepare(
       `UPDATE workflow_start_claims SET state = 'created', updated_at = ?
        WHERE org_id = ? AND id = ? AND state = 'claimed'`,
@@ -211,7 +231,9 @@ async function respondReplay(
     return fail(c, { status: 409, code: "IDEMPOTENCY_MISMATCH" });
   }
   if (claim.state === "claimed") {
-    await ensureInstance(c.env, claim.id, await paramsFor(c.env, request.orgId, claim));
+    if (!(await ensureInstance(c.env, claim.id, await paramsFor(c.env, request.orgId, claim)))) {
+      return fail(c, { status: 503, code: UNAVAILABLE, runId: claim.id });
+    }
     await c.env.DB.prepare(
       `UPDATE workflow_start_claims SET state = 'created', updated_at = ?
        WHERE org_id = ? AND id = ? AND state = 'claimed'`,
@@ -334,12 +356,14 @@ async function legacyActiveRun(env: Env, orgId: string, taskId: string): Promise
 async function settle(env: Env, orgId: string, claim: ClaimRow): Promise<Settlement> {
   let run = await runRow(env, orgId, claim.id);
   if (!run) {
-    // Never registered: the instance rejected its input, or a created instance is gone.
-    // A missing instance for a 'claimed' row is a crash before create and is reconciled instead.
-    const status = await instanceStatus(env, claim.id);
+    // Never registered: release only on positive evidence that the instance is dead, or was
+    // created and is now confirmed absent (rejected, deleted, or past retention). A missing
+    // instance for a 'claimed' row is a crash before create and is reconciled instead.
+    const instance = await instanceStatus(env, claim.id);
+    if (instance.kind === "unknown") return { kind: "unavailable" };
     const dead =
-      (status !== null && TERMINAL_INSTANCE.has(status)) ||
-      (status === null && claim.state === "created");
+      (instance.kind === "found" && TERMINAL_INSTANCE.has(instance.status)) ||
+      (instance.kind === "missing" && claim.state === "created");
     if (!dead) return { kind: "active" };
     return (await release(env, orgId, claim.id, "never_registered"))
       ? { kind: "released" }
@@ -351,8 +375,16 @@ async function settle(env: Env, orgId: string, claim: ClaimRow): Promise<Settlem
       : { kind: "active" };
   }
   if (ACTIVE_RUN.has(run.status)) {
-    const status = await instanceStatus(env, claim.id);
-    if (status !== "errored" && status !== "terminated") return { kind: "active" };
+    const instance = await instanceStatus(env, claim.id);
+    if (instance.kind === "unknown") return { kind: "unavailable" };
+    // A registered run whose instance is missing stays active: absence alone is not a
+    // governance outcome, and the run row keeps the task blocked until it is explained.
+    if (
+      instance.kind !== "found" ||
+      (instance.status !== "errored" && instance.status !== "terminated")
+    ) {
+      return { kind: "active" };
+    }
     // The instance died without recording a governance outcome.
     await env.DB.prepare(
       `UPDATE workflow_runs SET status = 'paused', hold_reason = 'INSTANCE_FAILED', updated_at = ?
@@ -467,6 +499,9 @@ async function resolve(c: StartContext): Promise<Response> {
     .first<ClaimRow>();
   if (!claim) return fail(c, { status: 404, code: "NOT_FOUND" });
   const settled = claim.state === "released" ? null : await settle(c.env, orgId, claim);
+  if (settled?.kind === "unavailable") {
+    return fail(c, { status: 503, code: UNAVAILABLE, runId });
+  }
   if (!settled || settled.kind !== "held") {
     return fail(c, { status: 409, code: "WORKFLOW_NOT_HELD", runId });
   }
@@ -590,21 +625,36 @@ async function paramsFor(env: Env, orgId: string, claim: ClaimRow): Promise<Prod
   };
 }
 
-async function ensureInstance(env: Env, id: string, params: ProductionTaskParams): Promise<void> {
+// True when an instance with this id is known to exist. False means its existence could not
+// be confirmed; callers keep the claim unchanged and report the start as unavailable.
+async function ensureInstance(
+  env: Env,
+  id: string,
+  params: ProductionTaskParams,
+): Promise<boolean> {
   try {
     await env.PRODUCTION_TASK.create({ id, params });
-  } catch (error) {
-    // Same durable id means the same logical run; only a missing instance is a failure.
-    if ((await instanceStatus(env, id)) === null) throw error;
+    return true;
+  } catch {
+    // Same durable id means the same logical run, e.g. `instance.already_exists`.
+    return (await instanceStatus(env, id)).kind === "found";
   }
 }
 
-async function instanceStatus(env: Env, id: string): Promise<string | null> {
+async function instanceStatus(env: Env, id: string): Promise<InstanceState> {
   try {
-    return (await (await env.PRODUCTION_TASK.get(id)).status()).status;
-  } catch {
-    return null;
+    if (await takeEventFault(env, FAULT_WORKFLOW_STATUS)) {
+      throw new Error("workflow status lookup unavailable");
+    }
+    return { kind: "found", status: (await (await env.PRODUCTION_TASK.get(id)).status()).status };
+  } catch (error) {
+    return isNotFound(error) ? { kind: "missing" } : { kind: "unknown" };
   }
+}
+
+function isNotFound(error: unknown): boolean {
+  const text = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  return text.includes("instance.not_found");
 }
 
 async function runBody(

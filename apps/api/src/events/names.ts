@@ -5,3 +5,5 @@ export const DEAD_LETTER_QUEUE = "ai-company-os-dead-letter";
 export const FAULT_CRASH = "crash";
 export const FAULT_D1 = "d1";
 export const FAULT_AGENT = "agent_timeout";
+// Test-harness only: makes a Workflow status lookup throw a transient error.
+export const FAULT_WORKFLOW_STATUS = "workflow_status";

@@ -76,7 +76,7 @@ No P1 remains open. Every row still needs Cloudflare remote verification, listed
 | `pnpm format`, `pnpm lint`, `pnpm typecheck`                                    | STATIC_PASS                           | PASS                                                |
 | `python3 scripts/d1_preflight.py manifest` / `config`                           | STATIC_PASS                           | PASS (config `deploy_ready: false`: 3 placeholders) |
 | Staging `wrangler deploy --dry-run` without credentials                         | STATIC_PASS                           | PASS                                                |
-| `pnpm test`: 152 tests (domain 14, schemas 2, policy 15, api 121)               | UNIT_PASS + LOCAL_WORKER_RUNTIME_PASS | PASS (baseline 135; +17)                            |
+| `pnpm test`: 155 tests (domain 14, schemas 2, policy 15, api 124)               | UNIT_PASS + LOCAL_WORKER_RUNTIME_PASS | PASS (baseline 135; +20)                            |
 | Workflow entrypoint, bootstrap, and claim tests in workerd + local D1/Workflows | LOCAL_WORKER_RUNTIME_PASS             | PASS                                                |
 | `python3 scripts/test-migrations.py`: 11 tests                                  | INTEGRATION_PASS (SQLite)             | PASS (baseline 2; +9)                               |
 | `python3 scripts/test-d1-preflight.py`: 16 tests                                | UNIT_PASS                             | PASS                                                |

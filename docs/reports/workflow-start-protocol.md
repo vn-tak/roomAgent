@@ -104,12 +104,27 @@ a `workflow_runs` row.
 | Run is `paused` or `denied`                | **Held.** 409 `WORKFLOW_HELD` with `hold_reason`, for any key, |
 |                                            | until an explicit resolution (below)                           |
 | Instance errored before registering        | Released (`never_registered`) once `get(id).status()` reports  |
-|                                            | `errored`/`terminated`/`complete` (or a `created` one is gone) |
+|                                            | `errored`/`terminated`/`complete`, or a `created` claim's      |
+|                                            | instance is confirmed absent (`instance.not_found`)            |
+| Status lookup fails for any other reason   | **Fail closed.** 503 `WORKFLOW_STATUS_UNAVAILABLE` with the    |
+|                                            | existing `workflow_run_id`; claim unchanged, nothing created,  |
+|                                            | no resolution; the caller retries                              |
 | Registered run whose instance died at      | Run marked `paused`/`INSTANCE_FAILED`, released automatically  |
 | iteration 0                                | (`instance_failed`), at most twice per task                    |
 | Registered run whose instance died after   | Held as `INSTANCE_FAILED`: restarting would reset the revision |
 | consuming revisions, or a third crash      | budget                                                         |
 | Same key after a released, unstarted claim | 200 with the original id and status `not_started`              |
+
+### Instance status classification
+
+`instanceStatus()` returns one of three states. `found` carries the reported status. `missing`
+is returned only when the error carries the `instance.not_found` code. Every other failure,
+including timeouts and service errors, is `unknown`. Only `missing` or a terminal `found`
+status can release a claim that has no run row. `unknown` never releases a claim, never
+creates or reconciles an instance, and never accepts a resolution. A claim that is
+`claimed` but not yet `created` reconciles with `create({ id })` only after `missing` is
+confirmed. `ensureInstance()` treats a failed `create()` as success only when the same id is
+then `found`.
 
 ### Holds and explicit resolution
 
@@ -156,29 +171,33 @@ grants no review or approval power.
 
 ## Regression tests
 
-`apps/api/test/workflow-start-entrypoint.test.ts` (7), `workflow-hold-resolution.test.ts` (3), and
+`apps/api/test/workflow-start-entrypoint.test.ts` (7), `workflow-hold-resolution.test.ts` (3),
+`workflow-start-faults.test.ts` (3), and
 `apps/api/test/production-task-workflow.test.ts` (+1):
 
-| Required case                         | Test evidence                                                                                                             |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Authorized start → PASS               | 201, run registers `running`, claim actor is the session owner                                                            |
-| Unauthorized start → DENY             | anonymous 401, QA 403, worker 403                                                                                         |
-| Wrong organization → DENY             | foreign session 401, foreign org path 404                                                                                 |
-| Wrong task/artifact relationship      | foreign artifact 404, sibling task 409 `ARTIFACT_TASK_MISMATCH`                                                           |
-| Wrong artifact version → DENY         | future and superseded versions 409 `ARTIFACT_VERSION_STALE`                                                               |
-| Duplicate request → same workflow     | 200, same id, `duplicate: true`; reused key 409                                                                           |
-| Concurrent start → no duplicate       | 3 parallel requests → exactly one 201, one claim, one instance                                                            |
-| Workflow event before evidence        | wakeups without stored evidence leave stage `qa_review`                                                                   |
-| Authorized QA evidence → advance      | QA PASS → `security`; security PASS → `waiting_for_approval`                                                              |
-| Forged evidence → cannot advance      | worker review 403, forged human-approval wakeup ignored                                                                   |
-| Human approval missing → no complete  | remains `waiting_for_approval` until owner HTTP final approval                                                            |
-| Restart/retry → recoverable           | stranded claim reconciled; denied run held until resolved, then a new run admitted                                        |
-| LOOP_GUARD cannot be reset by Manager | real 8-revision loop → held; new keys 409; manager/executive resolution 403; owner resolution audited, then new run       |
-| TIMEOUT policy and budget             | forced event timeout → held; starter cannot self-resolve; approvers resolve; 4th resolution `RESOLUTION_BUDGET_EXHAUSTED` |
-| Failed instance after revisions       | terminated at iteration 1 → held `INSTANCE_FAILED`, released only by resolution                                           |
-| DB enforcement (SQLite)               | `scripts/test-migrations.py` `WorkflowHoldPolicyTests` (5)                                                                |
-| Untraceable instance                  | direct `create()` without claim → `errored`, no run row                                                                   |
-| Dead instance                         | errored-unregistered and terminated-registered runs release task                                                          |
+| Required case                         | Test evidence                                                                                                                                                                             |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Authorized start → PASS               | 201, run registers `running`, claim actor is the session owner                                                                                                                            |
+| Unauthorized start → DENY             | anonymous 401, QA 403, worker 403                                                                                                                                                         |
+| Wrong organization → DENY             | foreign session 401, foreign org path 404                                                                                                                                                 |
+| Wrong task/artifact relationship      | foreign artifact 404, sibling task 409 `ARTIFACT_TASK_MISMATCH`                                                                                                                           |
+| Wrong artifact version → DENY         | future and superseded versions 409 `ARTIFACT_VERSION_STALE`                                                                                                                               |
+| Duplicate request → same workflow     | 200, same id, `duplicate: true`; reused key 409                                                                                                                                           |
+| Concurrent start → no duplicate       | 3 parallel requests → exactly one 201, one claim, one instance                                                                                                                            |
+| Workflow event before evidence        | wakeups without stored evidence leave stage `qa_review`                                                                                                                                   |
+| Authorized QA evidence → advance      | QA PASS → `security`; security PASS → `waiting_for_approval`                                                                                                                              |
+| Forged evidence → cannot advance      | worker review 403, forged human-approval wakeup ignored                                                                                                                                   |
+| Human approval missing → no complete  | remains `waiting_for_approval` until owner HTTP final approval                                                                                                                            |
+| Restart/retry → recoverable           | stranded claim reconciled; denied run held until resolved, then a new run admitted                                                                                                        |
+| LOOP_GUARD cannot be reset by Manager | real 8-revision loop → held; new keys 409; manager/executive resolution 403; owner resolution audited, then new run                                                                       |
+| TIMEOUT policy and budget             | forced event timeout → held; starter cannot self-resolve; approvers resolve; 4th resolution `RESOLUTION_BUDGET_EXHAUSTED`                                                                 |
+| Failed instance after revisions       | terminated at iteration 1 → held `INSTANCE_FAILED`, released only by resolution                                                                                                           |
+| DB enforcement (SQLite)               | `scripts/test-migrations.py` `WorkflowHoldPolicyTests` (5)                                                                                                                                |
+| Untraceable instance                  | direct `create()` without claim → `errored`, no run row                                                                                                                                   |
+| Dead instance                         | errored-unregistered and terminated-registered runs release task                                                                                                                          |
+| Ambiguous status (fault injection)    | live, unregistered instance + status lookup throws → 503 for new keys and 3 concurrent starts; claim stays `created`, one instance; after recovery 409 `WORKFLOW_ACTIVE` with the same id |
+| Confirmed not-found + recovery        | `created` claim with no instance: 503 while lookup fails, then `never_registered` release and one new run                                                                                 |
+| Crashed-before-create + fault         | `claimed` claim: 503 while lookup fails; after recovery, same key reconciles the same id                                                                                                  |
 
 Existing direct-binding tests now write the same claim with a fixture
 (`claimWorkflowStart`) before `create()`, because unclaimed instances are rejected by design.
@@ -188,13 +207,19 @@ Existing direct-binding tests now write the same claim with a fixture
 - Eligibility reads D1 projections; TaskDO projects synchronously, but a concurrent task
   transition between the check and `registerRun` makes the instance error and the claim
   release on the next start. This is fail-closed, not a lost run.
-- Instances past Workflows retention (30 days on Paid) cannot be inspected. A `created` claim
-  with no run row and no instance is released.
+- Instances past Workflows retention (30 days on Paid) are reported as not found. A `created`
+  claim with no run row is then released as `never_registered`.
+- If the deployed Workflows service reports a missing instance without the
+  `instance.not_found` code, the claim stays unreleased and starts for that task return 503.
+  That is fail-closed, but it must be checked on staging.
+- The local emulator's `get()` turns any status failure into `instance.not_found`. Transient
+  failures are therefore injected through the test-harness fault seam, which is inactive
+  outside the Vitest bindings.
 - The `workflow_runs` projection is not yet exposed on a read route.
 
 ## Cloudflare remote verification required
 
 - Workflow instance creation, `instance.already_exists`, and `get()` semantics on the deployed
-  Workflows service, including retention.
+  Workflows service, including retention and the exact not-found error code.
 - D1 partial unique index and trigger behavior on remote D1 under concurrent requests.
 - `REMOTE_NOT_TESTED`.
