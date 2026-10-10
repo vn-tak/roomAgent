@@ -14,7 +14,7 @@
       "binding": "DB",
       "database_name": "ai-company-os-staging",
       // Placeholder until the operator provisions D1; the preflight refuses to pass on it.
-      "database_id": "REPLACE_WITH_PROVISIONED_STAGING_D1_UUID",
+      "database_id": "a6b8c2f6-d697-442b-8374-5006246324b2",
       "migrations_dir": "../../migrations",
     },
   ],

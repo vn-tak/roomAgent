@@ -170,11 +170,19 @@ class D1PreflightTests(unittest.TestCase):
         renamed = copy.deepcopy(CONFIG)
         renamed["name"] = "ai-company-os-api"
         self.assertIn("CONFIG_NOT_STAGING_WORKER", reasons(verify(evidence(database(0)), config=renamed), "STAGING_DB_IDENTITY_VERIFIED"))
-        # The committed target still holds a placeholder database id until provisioning.
-        repo_target = json.loads(pf.TARGET.read_text())
-        report = verify(evidence(database(0)), target=repo_target, config=pf.load_jsonc(pf.STAGING_CONFIG))
+        # A target that still holds a placeholder database id is rejected until provisioning.
+        placeholder_target = json.loads(pf.TARGET.read_text())
+        placeholder_target["database_id"] = "REPLACE_WITH_PROVISIONED_STAGING_D1_UUID"
+        placeholder_config = copy.deepcopy(pf.load_jsonc(pf.STAGING_CONFIG))
+        placeholder_config["d1_databases"][0]["database_id"] = "REPLACE_WITH_PROVISIONED_STAGING_D1_UUID"
+        report = verify(evidence(database(0)), target=placeholder_target, config=placeholder_config)
         self.assertIn("TARGET_DATABASE_ID_UNSET", reasons(report, "STAGING_DB_IDENTITY_VERIFIED"))
         self.assertFalse(report["apply_allowed"])
+        # The committed staging config and target agree on the provisioned database id.
+        committed_target = json.loads(pf.TARGET.read_text())
+        committed_config = pf.load_jsonc(pf.STAGING_CONFIG)
+        self.assertEqual(committed_target["database_id"], committed_config["d1_databases"][0]["database_id"])
+        self.assertNotIn("REPLACE_WITH", committed_target["database_id"])
 
     def test_modified_historical_migration_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -250,7 +258,7 @@ class StagingConfigTests(unittest.TestCase):
         self.assertEqual(report["result"], "PASS", report["gates"])
         self.assertTrue(report["DO_REMOTE_PROVISIONING_NOT_PERFORMED"])
         self.assertFalse(report["deploy_ready"])
-        self.assertIn("d1:ai-company-os-staging", report["unprovisioned_placeholders"])
+        self.assertEqual(report["unprovisioned_placeholders"], ["var:ACCESS_TEAM_DOMAIN", "var:ACCESS_AUD"])
 
     def test_reusing_a_base_resource_is_rejected(self):
         staging = copy.deepcopy(self.staging)
