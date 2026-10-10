@@ -3,7 +3,7 @@
   "account_id": "ef250a88911fd24073cb73d1c07e0218",
   "binding": "DB",
   "database_name": "ai-company-os-staging",
-  "database_id": "REPLACE_WITH_PROVISIONED_STAGING_D1_UUID",
+  "database_id": "a6b8c2f6-d697-442b-8374-5006246324b2",
   "wrangler_config": "apps/api/wrangler.staging.jsonc",
   "migrations": "deploy/d1/migrations.manifest.json"
 }
