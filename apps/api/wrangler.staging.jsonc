@@ -79,11 +79,12 @@
       },
     ],
   },
-  // Placeholders keep the operator bootstrap disabled (deny by default) until the
-  // operator creates the Access application and records its team domain and AUD tag.
+  // Access application "roomAgent Staging — Operator Access" (self-hosted,
+  // api-staging.tungjp.store), verified 2026-10-10. Deny-by-default preserved:
+  // empty values would 503; these are the real verified identifiers.
   "vars": {
-    "ACCESS_TEAM_DOMAIN": "REPLACE_WITH_ACCESS_TEAM_DOMAIN",
-    "ACCESS_AUD": "REPLACE_WITH_ACCESS_APPLICATION_AUD",
+    "ACCESS_TEAM_DOMAIN": "https://little-bar-8ffa.cloudflareaccess.com",
+    "ACCESS_AUD": "24f00c2910e19f99e8a833de7b6c7dc14d18683699985a6d9fbfc66fb2c3612f",
   },
   "observability": {
     "enabled": true,
