@@ -257,8 +257,25 @@ class StagingConfigTests(unittest.TestCase):
         report = self.check(self.staging)
         self.assertEqual(report["result"], "PASS", report["gates"])
         self.assertTrue(report["DO_REMOTE_PROVISIONING_NOT_PERFORMED"])
+        # Access provisioned 2026-10-10 (ROOMAGENT_STAGING_ACCESS_AND_DEPLOY_CONFIG_V1):
+        # ACCESS_TEAM_DOMAIN / ACCESS_AUD now hold verified values, so the config
+        # is legitimately deploy-ready. The old placeholder assertions below are kept
+        # as a guard for the pre-provisioning state via test_placeholders_block_deploy_ready.
+        self.assertTrue(report["deploy_ready"])
+        self.assertEqual(report["unprovisioned_placeholders"], [])
+
+    def test_placeholders_block_deploy_ready(self):
+        # Safety guard: a staging config that still carries REPLACE_WITH_*
+        # placeholders must NOT be considered deploy-ready.
+        staging = copy.deepcopy(self.staging)
+        staging["vars"]["ACCESS_TEAM_DOMAIN"] = "REPLACE_WITH_ACCESS_TEAM_DOMAIN"
+        staging["vars"]["ACCESS_AUD"] = "REPLACE_WITH_ACCESS_APPLICATION_AUD"
+        report = self.check(staging)
         self.assertFalse(report["deploy_ready"])
-        self.assertEqual(report["unprovisioned_placeholders"], ["var:ACCESS_TEAM_DOMAIN", "var:ACCESS_AUD"])
+        self.assertEqual(
+            report["unprovisioned_placeholders"],
+            ["var:ACCESS_TEAM_DOMAIN", "var:ACCESS_AUD"],
+        )
 
     def test_reusing_a_base_resource_is_rejected(self):
         staging = copy.deepcopy(self.staging)
