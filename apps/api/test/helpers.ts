@@ -94,3 +94,35 @@ export async function storedRoleCount(orgId: string, employeeId: string): Promis
     .first<{ n: number }>();
   return row?.n ?? 0;
 }
+
+// Fixture for tests that drive the workflow binding directly: writes the same durable
+// start claim the HTTP entrypoint records before it creates an instance.
+export async function claimWorkflowStart(
+  runId: string,
+  params: { orgId: string; taskId: string; artifactId: string; version: number },
+): Promise<void> {
+  const owner = await env.DB.prepare(
+    `SELECT created_by_user_id AS id FROM organizations WHERE id = ?`,
+  )
+    .bind(params.orgId)
+    .first<{ id: string }>();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO workflow_start_claims (
+       id, org_id, task_id, artifact_id, artifact_version, actor_type, actor_id,
+       idempotency_key, state, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, 'human', ?, ?, 'claimed', ?, ?)`,
+  )
+    .bind(
+      runId,
+      params.orgId,
+      params.taskId,
+      params.artifactId,
+      params.version,
+      owner?.id ?? "",
+      `fixture_${runId.slice(4, 28)}`,
+      now,
+      now,
+    )
+    .run();
+}

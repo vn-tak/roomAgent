@@ -21,6 +21,7 @@ import {
 import {
   agentStub,
   artifactStub,
+  claimWorkflowStart,
   createStudio,
   hire,
   openBrowserSession,
@@ -584,6 +585,7 @@ describe("AI STUDIO LAB company POC", () => {
         roomId: room.id,
         correlationId: taskTrace?.correlation_id ?? "",
       };
+      await claimWorkflowStart(runId, params);
       await env.PRODUCTION_TASK.create({ id: runId, params });
       await untilWorkflowStage(studio.org.id, runId, "qa_review");
 

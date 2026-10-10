@@ -1,4 +1,4 @@
-import { FAULT_AGENT, FAULT_CRASH, FAULT_D1 } from "./names";
+import { FAULT_AGENT, FAULT_CRASH, FAULT_D1, FAULT_WORKFLOW_STATUS } from "./names";
 
 const FAULTS = "event_test_faults";
 const COUNTERS = "event_test_counters";
@@ -9,7 +9,7 @@ export function isTestHarness(env: object): boolean {
 
 export async function armEventFault(
   db: D1Database,
-  kind: typeof FAULT_CRASH | typeof FAULT_D1 | typeof FAULT_AGENT,
+  kind: typeof FAULT_CRASH | typeof FAULT_D1 | typeof FAULT_AGENT | typeof FAULT_WORKFLOW_STATUS,
   remaining: number,
 ): Promise<void> {
   await ensureFaults(db);

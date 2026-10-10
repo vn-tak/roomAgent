@@ -9,7 +9,12 @@ export default defineConfig(async () => {
       cloudflareTest({
         wrangler: { configPath: "./wrangler.jsonc" },
         miniflare: {
-          bindings: { TEST_MIGRATIONS: migrations },
+          bindings: {
+            TEST_MIGRATIONS: migrations,
+            // Test-only Access application; the test signs tokens and serves its own JWKS.
+            ACCESS_TEAM_DOMAIN: "https://roomagent-test.cloudflareaccess.com",
+            ACCESS_AUD: "a".repeat(64),
+          },
         },
       }),
     ],

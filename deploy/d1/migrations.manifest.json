@@ -1,0 +1,65 @@
+{
+  "format": 1,
+  "migrations": [
+    {
+      "name": "0001_phase1_schema.sql",
+      "sha256": "451b3194446917febd50fb1001a21d1c5ddb1b0603a132356eb6f14ede8fdc1a"
+    },
+    {
+      "name": "0002_phase1_permission_catalog.sql",
+      "sha256": "33cdedcabd855dcf216c4196538cf57d1aaf72315b5150b3697a7cca35f54a10"
+    },
+    {
+      "name": "0003_phase2_authority.sql",
+      "sha256": "af922b9b11eed48263ab284dd2d5565804eb2cbf896f0785785500391644a14e"
+    },
+    {
+      "name": "0004_phase3_room_sequence.sql",
+      "sha256": "e500ead11ec73f4b1fafbf7c7092bdf0aca45ff91862a5b25907eeba0ef49d12"
+    },
+    {
+      "name": "0005_phase4_agent_join.sql",
+      "sha256": "404110601a77cf651a557123a3a31ef9d3ae49e51cbd180737001171ea3c7bb9"
+    },
+    {
+      "name": "0006_phase5_tasks.sql",
+      "sha256": "e788bbfa3279cfbed67765cb2d0cbad94f04646f456348694b4628ca4f32a325"
+    },
+    {
+      "name": "0007_phase6_events.sql",
+      "sha256": "ed2e149464a80fb5c35cc59539e469b2081f9661ec64c9b7162511826ea380ba"
+    },
+    {
+      "name": "0008_phase7_artifacts.sql",
+      "sha256": "ceadb301cee1feb2c2d861b1157b4289b42b36cc41af7b606df3dc279f7eba54"
+    },
+    {
+      "name": "0009_phase8_governance.sql",
+      "sha256": "2930cd311630ee7156b05ae30e6f6ab26c5f37d54d83b51237c48ea2b2f2383c"
+    },
+    {
+      "name": "0010_phase9_workflows.sql",
+      "sha256": "3aeaec61d92f461d3b7a537590715adf88b2811e41027d03b319d8f29b4b2487"
+    },
+    {
+      "name": "0011_architecture_integrity_and_human_sessions.sql",
+      "sha256": "4fadc1ebe111b922e73a5eb74b248190e60e5e2d6a6628fafd8e0fed4b6c35a0"
+    },
+    {
+      "name": "0012_task_completion_and_trace.sql",
+      "sha256": "e5593d00226ad0ac21636c26bbb246cb0b04efe489f65ad6eda78feff3af5798"
+    },
+    {
+      "name": "0013_direct_artifact_size.sql",
+      "sha256": "d002a516a75f24600dcd503f109f7f17debc92b3aef09dc43570faa559e4d8d2"
+    },
+    {
+      "name": "0014_workflow_completed_version.sql",
+      "sha256": "dd5c3b5b04614f375d2324855f3c9e23e250a27ac64589a9b2c8dd0bf4803d5d"
+    },
+    {
+      "name": "0015_workflow_start_claims_and_human_identities.sql",
+      "sha256": "8536ff2d19f94f3952f9f17764d68e15fba3b53cd5d15bd3037011d1383a55eb"
+    }
+  ]
+}

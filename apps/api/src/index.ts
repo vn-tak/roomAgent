@@ -2,8 +2,10 @@ import { sha256Hex, isId } from "@ai-company/domain";
 import { Hono } from "hono";
 import { registerArtifactRoutes } from "./artifacts-route";
 import { registerGovernanceRoutes } from "./governance-route";
+import { registerHumanBootstrapRoutes } from "./human-bootstrap-route";
 import { handleQueue } from "./events/consumer";
 import { resolveHttpPrincipal } from "./http-principal";
+import { registerWorkflowStartRoutes } from "./workflow-start-route";
 
 export { AgentDO } from "@ai-company/agent";
 export { ArtifactDO } from "@ai-company/artifact";
@@ -244,6 +246,8 @@ app.get("/orgs/:orgId/agents/:employeeId/socket", async (c) => {
 
 registerArtifactRoutes(app);
 registerGovernanceRoutes(app);
+registerHumanBootstrapRoutes(app);
+registerWorkflowStartRoutes(app);
 
 app.notFound((c) =>
   c.json(
